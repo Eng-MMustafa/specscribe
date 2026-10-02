@@ -1,0 +1,5 @@
+{
+  "name": "nest-smoke",
+  "private": true,
+  "description": "Project root for the zero-config e2e: forRoot() with no options finds src/ from here."
+}

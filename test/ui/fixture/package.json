@@ -1,0 +1,9 @@
+{
+  "name": "specscribe-ui-fixture",
+  "private": true,
+  "description": "Express app the browser tests scan and run (dependencies come from the repository root).",
+  "dependencies": {
+    "express": "*",
+    "multer": "*"
+  }
+}

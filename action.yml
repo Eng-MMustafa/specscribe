@@ -1,0 +1,147 @@
+name: 'SpecScribe API Check'
+description: >-
+  API contract gate for NestJS pull requests: documentation health score,
+  breaking-change detection against a base branch, and optional scenario
+  tests — no app bootstrap, no database.
+author: 'Mohamed Mustafa'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  source:
+    description: 'Path to the directory containing your @Controller() classes'
+    required: false
+    default: 'src'
+  base-ref:
+    description: >-
+      Branch to diff the API contract against (e.g. main). Leave empty to
+      skip breaking-change detection. Requires actions/checkout with
+      fetch-depth: 0.
+    required: false
+    default: ''
+  fail-on-breaking:
+    description: 'Fail the job when the diff finds a breaking change'
+    required: false
+    default: 'true'
+  min-score:
+    description: 'Minimum docs health score (0-100). 0 reports without failing.'
+    required: false
+    default: '0'
+  global-prefix:
+    description: 'Value your app passes to app.setGlobalPrefix()'
+    required: false
+    default: ''
+  scenarios:
+    description: >-
+      Path to a *.scenario.json file or directory to run against a live
+      server. Leave empty to skip. The server must already be reachable.
+    required: false
+    default: ''
+  base-url:
+    description: 'Base URL for scenario tests (overrides the scenario files)'
+    required: false
+    default: ''
+  version:
+    description: 'specscribe version to run'
+    required: false
+    default: '1.0.0'
+
+runs:
+  using: 'composite'
+  steps:
+    # The scanner needs the project's own TypeScript (a peer dependency), so
+    # this action must run after the usual `npm ci` step.
+    - name: Documentation health
+      shell: bash
+      env:
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_GLOBAL_PREFIX: ${{ inputs.global-prefix }}
+        INPUT_MIN_SCORE: ${{ inputs.min-score }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$INPUT_SOURCE" in
+          /*|*..*) echo "Invalid source path: must be relative and not contain .." >&2; exit 1 ;;
+        esac
+        if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "Invalid version format" >&2
+          exit 1
+        fi
+
+        DOCTOR_ARGS=("$INPUT_SOURCE")
+        if [ -n "$INPUT_MIN_SCORE" ]; then
+          DOCTOR_ARGS+=(--min-score "$INPUT_MIN_SCORE")
+        fi
+        if [ -n "$INPUT_GLOBAL_PREFIX" ]; then
+          DOCTOR_ARGS+=(--globalPrefix "$INPUT_GLOBAL_PREFIX")
+        fi
+
+        npx --yes "specscribe@$INPUT_VERSION" doctor "${DOCTOR_ARGS[@]}"
+
+    - name: Breaking-change detection
+      if: inputs.base-ref != ''
+      shell: bash
+      env:
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_GLOBAL_PREFIX: ${{ inputs.global-prefix }}
+        INPUT_FAIL_ON_BREAKING: ${{ inputs.fail-on-breaking }}
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$INPUT_SOURCE" in
+          /*|*..*) echo "Invalid source path: must be relative and not contain .." >&2; exit 1 ;;
+        esac
+        case "$INPUT_BASE_REF" in
+          *..*|*\\*|*$'\n'*) echo "Invalid base-ref" >&2; exit 1 ;;
+        esac
+        if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "Invalid version format" >&2
+          exit 1
+        fi
+
+        git fetch origin "$INPUT_BASE_REF" --depth=1
+        git worktree add --detach /tmp/specscribe-base "origin/$INPUT_BASE_REF"
+
+        FLAGS=()
+        if [ "$INPUT_FAIL_ON_BREAKING" = "true" ]; then
+          FLAGS+=(--fail-on-breaking)
+        fi
+        if [ -n "$INPUT_GLOBAL_PREFIX" ]; then
+          FLAGS+=(--globalPrefix "$INPUT_GLOBAL_PREFIX")
+        fi
+
+        npx --yes "specscribe@$INPUT_VERSION" diff \
+          "/tmp/specscribe-base/$INPUT_SOURCE" "$INPUT_SOURCE" "${FLAGS[@]}"
+
+        git worktree remove --force /tmp/specscribe-base
+
+    - name: Scenario tests
+      if: inputs.scenarios != ''
+      shell: bash
+      env:
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_GLOBAL_PREFIX: ${{ inputs.global-prefix }}
+        INPUT_SCENARIOS: ${{ inputs.scenarios }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$INPUT_SOURCE" in
+          /*|*..*) echo "Invalid source path: must be relative and not contain .." >&2; exit 1 ;;
+        esac
+        if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "Invalid version format" >&2
+          exit 1
+        fi
+
+        TEST_ARGS=(--spec "$INPUT_SOURCE")
+        if [ -n "$INPUT_BASE_URL" ]; then
+          TEST_ARGS+=(--baseUrl "$INPUT_BASE_URL")
+        fi
+        if [ -n "$INPUT_GLOBAL_PREFIX" ]; then
+          TEST_ARGS+=(--globalPrefix "$INPUT_GLOBAL_PREFIX")
+        fi
+
+        npx --yes "specscribe@$INPUT_VERSION" test "$INPUT_SCENARIOS" "${TEST_ARGS[@]}"

@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    # Without this, a `v*` tag matches no filter, no run starts, and the
+    # publish job below — which guards on exactly that ref — can never
+    # execute. Pushing a release tag would succeed and release nothing.
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # 18 and 20 are past upstream end-of-life but still run in many
+        # companies; they stay supported for as long as they work.
+        node-version: [18.x, 20.x, 22.x, 24.x]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      # Linting does not depend on the Node version, so it runs on one leg of
+      # the matrix rather than three.
+      - name: Lint
+        if: matrix.node-version == '20.x'
+        run: npm run lint
+
+      - run: npm run build
+
+      # Catches dev-only dependencies leaking into the runtime import graph,
+      # which would crash every `npm ci --omit=dev` install.
+      - run: npm run verify:runtime-deps
+
+      - run: npm test
+
+  compat:
+    name: NestJS ${{ matrix.nest-version }} on Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+
+    # Every NestJS major on the Node versions it supports. The HTTP adapters
+    # bring their own server: Nest 10 → Express 4 + Fastify 4, Nest 11/12 →
+    # Express 5 + Fastify 5, so both majors of each are booted for real.
+    # Nest 12 is ESM-only and loads through Node's require(esm) (20.19+ / 22.12+).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { nest-version: '10', node-version: 18.x }
+          - { nest-version: '10', node-version: 20.x }
+          - { nest-version: '11', node-version: 20.x }
+          - { nest-version: '11', node-version: 22.x }
+          - { nest-version: '12', node-version: 20.x }
+          - { nest-version: '12', node-version: 22.x }
+          - { nest-version: '12', node-version: 24.x }
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      # Both adapters are installed so the e2e suite can boot each one. Fastify
+      # exposes a different response API, which used to break the docs routes.
+      - name: Install NestJS ${{ matrix.nest-version }}
+        run: |
+          npm install --no-save --ignore-scripts \
+            @nestjs/common@^${{ matrix.nest-version }} \
+            @nestjs/core@^${{ matrix.nest-version }} \
+            @nestjs/platform-express@^${{ matrix.nest-version }} \
+            @nestjs/platform-fastify@^${{ matrix.nest-version }}
+
+      - name: Versions under test
+        run: |
+          node -e "for (const p of ['@nestjs/core','express','fastify']) { const f = require('path').join('node_modules', p, 'package.json'); console.log(p, JSON.parse(require('fs').readFileSync(f, 'utf8')).version) }"
+
+      - run: npm run build
+
+      - name: Boot real Nest apps on Express and Fastify
+        run: npm run test:e2e
+
+  typescript:
+    name: TypeScript ${{ matrix.typescript }}
+    runs-on: ubuntu-latest
+
+    # The NestJS scanners use the project's own TypeScript. 5.0 is the oldest
+    # supported; 7 (native port) has no compiler API yet, so it must degrade
+    # to a clear message without breaking anything.
+    strategy:
+      fail-fast: false
+      matrix:
+        typescript: ['5.0', '5', '6', '7']
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      # Built with the repository's own compiler, then scanned with the target.
+      - run: npm run build
+
+      - name: Install TypeScript ${{ matrix.typescript }}
+        run: npm install --no-save --ignore-scripts typescript@${{ matrix.typescript }}
+
+      - name: Scan the sample app
+        run: node scripts/check-typescript-compat.js
+
+  ui:
+    name: Docs UI in a real browser
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - run: npm run build
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Login + token capture, uploads, mock mode and fallback, scenarios,
+      # WebSocket auto-detection, keyboard-only use, RTL, phone layout,
+      # static export and an axe-core accessibility audit of both themes.
+      - run: npm run test:ui
+
+      - name: Upload traces of failed tests
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-test-results
+          path: test-results/
+          retention-days: 7
+
+  api-contract:
+    name: API contract diff
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # A full clone is needed to materialise the base branch below.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - run: npm run build
+
+      # Dogfooding: the library reports on its own example API using its own
+      # diff. No application is booted, so this needs no services of any kind.
+      #
+      # This step reports rather than gates: the fixture is test data and is
+      # expected to change. `--fail-on-breaking` belongs in a consumer's own
+      # pipeline, and is covered by test/e2e/cli.e2e.test.ts.
+      - name: Compare the API contract against the base branch
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/base "origin/${{ github.base_ref }}"
+
+          BASE_FIXTURE=/tmp/base/test/fixtures/sample-app
+
+          # The fixture may not exist on the base branch yet, which is not a
+          # failure — it just means there is nothing to compare against.
+          if [ ! -d "$BASE_FIXTURE" ]; then
+            echo "Base branch has no sample-app fixture; skipping the diff." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          node dist/cli.js diff \
+            "$BASE_FIXTURE" \
+            ./test/fixtures/sample-app \
+            --format markdown \
+            --output api-diff.md
+
+          cat api-diff.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: hashFiles('api-diff.md') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: api-diff
+          path: api-diff.md
+
+  # A release tag must name the same version as package.json: npm refuses to
+  # reuse a version number, so a mismatch noticed afterwards cannot be fixed.
+  release-check:
+    name: Tag matches package version
+    runs-on: ubuntu-latest
+    needs: [test, compat, typescript, ui]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Compare the tag against package.json
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag v$TAG does not match package.json $PKG" >&2
+            exit 1
+          fi
+          echo "Tag and package agree on $PKG" >> "$GITHUB_STEP_SUMMARY"
+
+  # Publishes a `v*` tag to npm with provenance (a signed statement that the
+  # tarball was built from this repository at this commit), via npm trusted
+  # publishing (OIDC) — no long-lived npm token is stored anywhere.
+  # Off until the repository variable NPM_PUBLISH is set to `true`, after the
+  # package's trusted publisher has been configured on npmjs.com.
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [release-check]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.NPM_PUBLISH == 'true'
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Node 24 ships npm 11, which supports trusted publishing.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run verify:runtime-deps
+      - run: npm publish --provenance --access public
+
+  sonarcloud:
+    name: SonarCloud analysis
+    runs-on: ubuntu-latest
+    needs: [test]
+    # Pull requests are analysed without credentials; the token-bearing scan
+    # only runs on trusted pushes to the protected branches and release tags.
+    if: github.event_name == 'push'
+    # A fresh fork or repository has no SonarCloud token yet: skip instead of failing.
+    env:
+      HAS_SONAR: ${{ secrets.SONAR_TOKEN != '' }}
+
+    steps:
+      - name: SonarCloud not configured
+        if: env.HAS_SONAR != 'true'
+        run: echo "SONAR_TOKEN is not set; skipping the SonarCloud scan." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.HAS_SONAR == 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: env.HAS_SONAR == 'true'
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - if: env.HAS_SONAR == 'true'
+        run: npm ci --ignore-scripts
+      - if: env.HAS_SONAR == 'true'
+        run: npm run build
+      - if: env.HAS_SONAR == 'true'
+        run: npx jest --coverage --coverageReporters=lcov
+
+      - name: SonarCloud Scan
+        if: env.HAS_SONAR == 'true'
+        uses: SonarSource/sonarqube-scan-action@0303d6b62e310685c0e34d0b9cde218036885c4d # v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
