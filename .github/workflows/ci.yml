@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches: [master, main]
-    # Without this, a `v*` tag matches no filter, no run starts, and the
-    # publish job below — which guards on exactly that ref — can never
-    # execute. Pushing a release tag would succeed and release nothing.
-    tags: ['v*']
+    # Release tags only (v1.2.3): they start the version check and the
+    # publish job. The floating `v1` tag that GitHub Action users pin to
+    # (`uses: …/specscribe@v1`) is not a release and must not start a run.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
     branches: [master, main]
 
