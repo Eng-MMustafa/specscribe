@@ -5,6 +5,7 @@ import {
   getDecoratorArguments,
   getDecoratorName,
   objectPropertyInitializer,
+  staticString,
   stringLiteralValue,
 } from '../analysis/AstHelpers';
 
@@ -57,9 +58,8 @@ export function extractApiPropertyMetadata(node: ts.PropertyDeclaration | ts.Pro
   }
 
   const descriptionInit = objectPropertyInitializer(options, 'description');
-  if (descriptionInit && ts.isStringLiteral(descriptionInit)) {
-    meta.description = descriptionInit.text;
-  }
+  const description = descriptionInit ? staticString(descriptionInit) : undefined;
+  if (description !== undefined) meta.description = description;
 
   const exampleInit = objectPropertyInitializer(options, 'example');
   if (exampleInit) {
@@ -67,9 +67,8 @@ export function extractApiPropertyMetadata(node: ts.PropertyDeclaration | ts.Pro
   }
 
   const formatInit = objectPropertyInitializer(options, 'format');
-  if (formatInit && ts.isStringLiteral(formatInit)) {
-    meta.format = formatInit.text;
-  }
+  const format = formatInit ? staticString(formatInit) : undefined;
+  if (format !== undefined) meta.format = format;
 
   const typeInit = objectPropertyInitializer(options, 'type');
   if (typeInit) {
@@ -112,14 +111,12 @@ export function extractApiOperationMetadata(node: ts.MethodDeclaration): ApiOper
   const meta: ApiOperationMetadata = {};
 
   const summaryInit = objectPropertyInitializer(options, 'summary');
-  if (summaryInit && ts.isStringLiteral(summaryInit)) {
-    meta.summary = summaryInit.text;
-  }
+  const summary = summaryInit ? staticString(summaryInit) : undefined;
+  if (summary !== undefined) meta.summary = summary;
 
   const descriptionInit = objectPropertyInitializer(options, 'description');
-  if (descriptionInit && ts.isStringLiteral(descriptionInit)) {
-    meta.description = descriptionInit.text;
-  }
+  const description = descriptionInit ? staticString(descriptionInit) : undefined;
+  if (description !== undefined) meta.description = description;
 
   return meta;
 }

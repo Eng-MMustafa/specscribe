@@ -1,0 +1,5 @@
+{
+  "name": "versioned-smoke",
+  "private": true,
+  "description": "Project root for the URI-versioning e2e: forRoot() finds src/ from here."
+}

@@ -8,6 +8,9 @@ import {
   getDecorators,
   getJsDocInfo,
   numericLiteralValue,
+  staticString,
+  staticStringArray,
+  staticValue,
 } from '../analysis/AstHelpers';
 import { AnalyzedType, DtoAnalyzer } from '../utils/DtoAnalyzer';
 import { extractFileFields, fallbackFileField, FileFieldInfo } from '../utils/FileUploadExtractor';
@@ -126,6 +129,24 @@ export interface ParameterInfo {
   type: AnalyzedType;
   decorator?: string;
   parameterLocation?: 'path' | 'query' | 'header' | 'body' | 'file';
+}
+
+/** A version expression: string(s), constants, or `VERSION_NEUTRAL` (as `''`). */
+function versionValue(node: ts.Expression | undefined): string | string[] | undefined {
+  if (!node) return undefined;
+  const isNeutral = (n: ts.Node) => /(^|\.)VERSION_NEUTRAL$/.test(n.getText());
+  if (isNeutral(node)) return '';
+  if (ts.isArrayLiteralExpression(node)) {
+    const versions: string[] = [];
+    for (const element of node.elements) {
+      const value = isNeutral(element) ? '' : staticString(element) ?? (staticValue(element) !== undefined ? String(staticValue(element)) : undefined);
+      if (value !== undefined) versions.push(value);
+    }
+    return versions.length > 0 ? versions : undefined;
+  }
+  const values = staticStringArray(node);
+  if (!values || values.length === 0) return undefined;
+  return values.length === 1 ? values[0] : values;
 }
 
 export class ScannerService {
@@ -257,18 +278,9 @@ export class ScannerService {
   private extractDecoratorArgument(decorator: ts.Decorator): string | undefined {
     const args = getDecoratorArguments(decorator);
     if (args.length === 0) return '';
-    const firstArg = args[0];
-    if (ts.isStringLiteral(firstArg)) {
-      return firstArg.text;
-    }
-    if (ts.isArrayLiteralExpression(firstArg)) {
-      // `@Get(['a', 'b'])` registers several routes; the first is representative.
-      const first = firstArg.elements[0];
-      if (first && ts.isStringLiteral(first)) {
-        return first.text;
-      }
-    }
-    return undefined;
+    // Literals and constants alike: `@Get('me')`, `@Controller(ROUTES.USERS)`.
+    // `@Get(['a', 'b'])` registers several routes; the first is representative.
+    return staticStringArray(args[0])?.[0];
   }
 
   /**
@@ -289,16 +301,8 @@ export class ScannerService {
       for (const prop of firstArg.properties) {
         if (!ts.isPropertyAssignment(prop) || prop.name.getText() !== 'path') continue;
 
-        const initializer = prop.initializer;
-        if (ts.isStringLiteral(initializer)) {
-          return initializer.text;
-        }
-        if (ts.isArrayLiteralExpression(initializer)) {
-          const first = initializer.elements[0];
-          if (first && ts.isStringLiteral(first)) {
-            return first.text;
-          }
-        }
+        const path = staticStringArray(prop.initializer)?.[0];
+        if (path !== undefined) return path;
       }
       // An object without a `path` means the controller is mounted at the root.
       return '';
@@ -322,7 +326,11 @@ export class ScannerService {
       if (value !== undefined) return value;
     }
 
-    // Supports `@HttpCode(HttpStatus.NO_CONTENT)`.
+    // `@HttpCode(HttpStatus.UNPROCESSABLE_ENTITY)`, `@HttpCode(CREATED)`: any numeric constant.
+    const constant = first ? staticValue(first) : undefined;
+    if (typeof constant === 'number') return constant;
+
+    // Without type information, the common `HttpStatus` names.
     if (first && ts.isPropertyAccessExpression(first)) {
       const statusName = first.name.text;
       const known = HTTP_STATUS_NAMES[statusName];
@@ -350,33 +358,26 @@ export class ScannerService {
     };
   }
 
+  /**
+   * `@Version('2')`, `@Version(['1', '2'])`, `@Version(API_V2)` and, on a
+   * class, `@Controller({ path, version })`. `VERSION_NEUTRAL` is kept as `''`
+   * so it is distinguishable from "no version given" (which inherits the
+   * app's `defaultVersion` at runtime).
+   */
   private extractVersionDecorator(node: ts.ClassDeclaration | ts.MethodDeclaration): string | string[] | undefined {
     const versionDecorator = getDecorators(node).find(
       decorator => getDecoratorName(decorator) === 'Version',
     );
+    if (versionDecorator) return versionValue(getDecoratorArguments(versionDecorator)[0]);
 
-    if (!versionDecorator) return undefined;
-
-    const args = getDecoratorArguments(versionDecorator);
-    if (args.length === 0) return undefined;
-
-    const firstArg = args[0];
-
-    if (ts.isStringLiteral(firstArg)) {
-      return firstArg.text;
-    }
-
-    if (ts.isArrayLiteralExpression(firstArg)) {
-      const versions: string[] = [];
-      for (const element of firstArg.elements) {
-        if (ts.isStringLiteral(element)) {
-          versions.push(element.text);
-        }
-      }
-      return versions.length > 0 ? versions : undefined;
-    }
-
-    return undefined;
+    if (!ts.isClassDeclaration(node)) return undefined;
+    const controller = getDecorators(node).find(decorator => getDecoratorName(decorator) === 'Controller');
+    const options = controller ? getDecoratorArguments(controller)[0] : undefined;
+    if (!options || !ts.isObjectLiteralExpression(options)) return undefined;
+    const version = options.properties.find(
+      (prop): prop is ts.PropertyAssignment => ts.isPropertyAssignment(prop) && prop.name.getText() === 'version',
+    );
+    return version ? versionValue(version.initializer) : undefined;
   }
 
   private extractGuardTypes(node: ts.ClassDeclaration | ts.MethodDeclaration): string[] {

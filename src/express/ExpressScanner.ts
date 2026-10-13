@@ -5,7 +5,7 @@ import { friendlyNames, humanizeIdentifier } from './ExpressNaming';
 import { ExpressBodyInference, InferredBody } from './ExpressBodyInference';
 import { ExpressResponseInference, ResponseContext } from './ExpressResponseInference';
 import { ExpressSymbolRegistry } from './ExpressSymbolRegistry';
-import { matchBracket } from './ExpressLexical';
+import { balancedSlice, matchBracket, objectEntries } from './ExpressLexical';
 
 export interface ExpressRouteInfo {
   method: string;
@@ -22,6 +22,8 @@ export interface ExpressRouteInfo {
   uploadFields?: { name: string; multiple: boolean }[];
   consumes?: string[];
   bodySchema?: { properties: Record<string, any>; required: string[]; source?: InferredBody['source']; name?: string };
+  /** Router variable the route was declared on (`v1` in `v1.get(…)`); internal. */
+  receiver?: string;
 }
 
 export interface ExpressControllerInfo {
@@ -44,9 +46,24 @@ const IGNORED_DIRS = new Set([
 
 const ROUTE_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'all'];
 
+/** A route/mount path argument: `'/users'`, `\`/${BASE}/x\``, `ROUTES.USERS`, `ROUTES['USERS']`. */
+const PATH_ARG = `['"\`][^'"\`]+['"\`]|[A-Za-z_$][\\w$]*(?:\\s*\\.\\s*[A-Za-z_$][\\w$]*|\\[\\s*['"][^'"]+['"]\\s*\\])*`;
+const escapeRe = (value: string) => value.replace(/[.*+?^$()|[\]\\{}]/g, (ch) => `\\${ch}`);
+
+/** `const v1 = express.Router()`, `const api = Router()`, `const app = express()`. */
+function routerVariables(text: string): string[] {
+  const names = new Set<string>();
+  const decl = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:new\s+)?(?:express\s*\.\s*Router|Router|express)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = decl.exec(text)) !== null) names.add(m[1]);
+  return [...names];
+}
+
 interface MountInfo {
   prefix: string;
   targetFile: string;
+  /** Mounted export when a file exports several routers: `{ projectsV1, projectsV2 }`. */
+  exportName?: string;
 }
 
 interface ParsedFile {
@@ -98,14 +115,22 @@ export class ExpressScanner {
       // of as a standalone controller.
       if (item.isRouter && mountedTargets.has(item.filePath)) {
         const itemMounts = mounts.filter((m) => m.targetFile === item.filePath);
+        const covered = new Set<ExpressRouteInfo>();
         for (const mount of itemMounts) {
+          // `app.use('/api/v1', projectsV1)` mounts only the routes declared on that router.
+          const local = mount.exportName ? this.exportedLocal(item.filePath, mount.exportName) : undefined;
+          const routes = local ? item.routes.filter((r) => r.receiver === local) : item.routes;
+          routes.forEach((r) => covered.add(r));
+          if (!routes.length) continue;
           controllers.push({
             name: tag,
             filePath: item.filePath,
             basePath: mount.prefix,
-            routes: item.routes.map((r) => ({ ...this.prefixRoute(r, mount.prefix), tags: r.tags || [tag] })),
+            routes: routes.map((r) => ({ ...this.prefixRoute(r, mount.prefix), tags: r.tags || [tag] })),
           });
         }
+        const rest = item.routes.filter((r) => !covered.has(r));
+        if (rest.length) controllers.push({ name: tag, filePath: item.filePath, basePath: '', routes: rest.map((r) => ({ ...r, tags: r.tags || [tag] })) });
         continue;
       }
 
@@ -117,6 +142,8 @@ export class ExpressScanner {
       });
     }
 
+    // `receiver` only served mount matching.
+    for (const controller of controllers) controller.routes = controller.routes.map(({ receiver: _receiver, ...route }) => route);
     return controllers;
   }
 
@@ -147,8 +174,9 @@ export class ExpressScanner {
   private static parseFile(filePath: string, bodies: ExpressBodyInference, registry: ExpressSymbolRegistry): ParsedFile {
     const text = fs.readFileSync(filePath, 'utf-8');
     const routes = this.extractRoutes(text, filePath, bodies, registry);
-    const mounts = this.extractMounts(text, filePath);
-    const isRouter = /(?:module\s*\.\s*exports\s*=|export\s+default)\s*router\b/.test(text);
+    const mounts = this.extractMounts(text, filePath, registry);
+    const isRouter = /(?:module\s*\.\s*exports\s*=|export\s+default)\s*router\b/.test(text)
+      || /(?:express\s*\.\s*)?\bRouter\s*\(/.test(text);
 
     return { filePath, isRouter, routes, mounts };
   }
@@ -157,25 +185,39 @@ export class ExpressScanner {
     const routes: ExpressRouteInfo[] = [];
 
     // Capture route-builder declarations so we can associate chained calls.
-    const routeBuilderPattern = /(?:app|router|server)\.route\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+    const receivers = ['app', 'router', 'route', 'server', ...routerVariables(text)].map(escapeRe).join('|');
+    // Paths may be literals or constants (`router.get(ROUTES.USERS, …)`).
+    const pathValue = (arg: string): string | undefined => {
+      const trimmed = arg.trim();
+      if (/^['"]/.test(trimmed)) return trimmed.slice(1, -1);
+      return registry.resolveString(trimmed, filePath);
+    };
+
+    const routeBuilderPattern = new RegExp(`\\b(?:${receivers})\\.route\\s*\\(\\s*(${PATH_ARG})\\s*\\)`, 'g');
     const routeBuilders: { index: number; path: string }[] = [];
     let match: RegExpExecArray | null;
     while ((match = routeBuilderPattern.exec(text)) !== null) {
-      routeBuilders.push({ index: match.index, path: match[1] });
+      const value = pathValue(match[1]);
+      if (value !== undefined) routeBuilders.push({ index: match.index, path: value });
     }
 
     // Direct method calls: app.get('/users', ...), router.post('/users', requireAuth, ...)
     // Capture the full argument list so we can spot middleware and upload handlers.
     const methodPattern = new RegExp(
-      `(?:app|router|route|server)\\.(${ROUTE_METHODS.join('|')})\\s*\\(\\s*['"\`]([^'"\`]+)['"\`]\\s*(?:,\\s*([^)]*))?\\s*\\)`,
+      `\\b(${receivers})\\.(${ROUTE_METHODS.join('|')})\\s*\\(\\s*(${PATH_ARG})\\s*(?:,\\s*([^)]*))?\\s*\\)`,
       'g',
     );
 
     while ((match = methodPattern.exec(text)) !== null) {
-      const method = match[1];
-      const rawPath = match[2];
-      const middlewareArgs = match[3] || '';
+      const receiver = match[1];
+      const method = match[2];
+      const pathArg = match[3];
+      const middlewareArgs = match[4] || '';
       const start = match.index;
+      // A constant path needs a handler after it: `app.get(KEY)` is a settings read.
+      if (!/^['"`]/.test(pathArg.trim()) && !middlewareArgs.trim()) continue;
+      const rawPath = pathValue(pathArg);
+      if (rawPath === undefined || !rawPath.startsWith('/') && !/^['"`]/.test(pathArg.trim())) continue;
 
       // Find the closest preceding route builder if this call is chained.
       let builderPath: string | undefined;
@@ -207,6 +249,7 @@ export class ExpressScanner {
         { filePath, registry },
       );
       route.handlerName = handler;
+      route.receiver = receiver;
       routes.push(route);
     }
 
@@ -227,9 +270,16 @@ export class ExpressScanner {
     return bodyStart === -1 ? call : call.slice(0, bodyStart + 2);
   }
 
-  private static extractMounts(text: string, filePath: string): MountInfo[] {
+  private static extractMounts(text: string, filePath: string, registry?: ExpressSymbolRegistry): MountInfo[] {
     const mounts: MountInfo[] = [];
     const variableRequires = this.extractVariableRequires(text, filePath);
+    const namedImports = this.extractNamedImports(text, filePath);
+    const receivers = ['app', 'server', ...routerVariables(text)].map(escapeRe).join('|');
+    const prefixValue = (arg: string): string | undefined => {
+      const trimmed = arg.trim();
+      if (/^['"]/.test(trimmed)) return trimmed.slice(1, -1);
+      return registry?.resolveString(trimmed, filePath);
+    };
 
     // 1. Inline require: app.use('/api', require('./routes/api'))
     const inlinePattern = /(?:app|server)\.use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)\s*\)/g;
@@ -243,16 +293,61 @@ export class ExpressScanner {
     }
 
     // 2. Variable reference: const api = require('./routes/api'); app.use('/api', api)
-    const variablePattern = /(?:app|server)\.use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\)/g;
+    //    and named exports: const { projectsV1 } = require('./routes/projects'); app.use(API.V1, projectsV1)
+    const variablePattern = new RegExp(`\\b(?:${receivers})\\.use\\s*\\(\\s*(${PATH_ARG})\\s*,\\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*\\)`, 'g');
     while ((match = variablePattern.exec(text)) !== null) {
+      const prefix = prefixValue(match[1]);
+      if (prefix === undefined) continue;
       const variableName = match[2];
       const resolved = variableRequires.get(variableName);
       if (resolved) {
-        mounts.push({ prefix: match[1], targetFile: resolved });
+        mounts.push({ prefix, targetFile: resolved });
+        continue;
       }
+      const named = namedImports.get(variableName);
+      if (named) mounts.push({ prefix, targetFile: named.file, exportName: named.name });
     }
 
     return mounts;
+  }
+
+  /** `const { a, b: c } = require('./x')` and `import { a, b as c } from './x'`: local → export. */
+  private static extractNamedImports(text: string, filePath: string): Map<string, { file: string; name: string }> {
+    const map = new Map<string, { file: string; name: string }>();
+    const patterns: [RegExp, RegExp][] = [
+      [/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g, /\s*:\s*/],
+      [/import\s*\{([^}]*)\}\s*from\s*['"`]([^'"`]+)['"`]/g, /\s+as\s+/],
+    ];
+    for (const [pattern, alias] of patterns) {
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(text)) !== null) {
+        const file = this.resolveImportPath(match[2], filePath);
+        if (!file) continue;
+        for (const spec of match[1].split(',')) {
+          const [exported, local] = spec.trim().split(alias).map((x) => x.trim());
+          if (exported) map.set(local || exported, { file, name: exported });
+        }
+      }
+    }
+    return map;
+  }
+
+  /** The local router variable behind an export: `module.exports = { projectsV1: v1 }` → `v1`. */
+  private static exportedLocal(filePath: string, exportName: string): string {
+    let text = '';
+    try { text = fs.readFileSync(filePath, 'utf-8'); } catch { return exportName; }
+    const esc = escapeRe(exportName);
+    const objectExport = /module\.exports\s*=\s*\{/.exec(text);
+    if (objectExport) {
+      const inner = balancedSlice(text, text.indexOf('{', objectExport.index + objectExport[0].length - 1)).slice(1, -1);
+      const entry = objectEntries(inner).find((e) => e.key === exportName);
+      if (entry) return entry.shorthand ? exportName : entry.value.trim();
+    }
+    const assigned = new RegExp(`(?:module\\.)?exports\\.${esc}\\s*=\\s*([A-Za-z_$][\\w$]*)`).exec(text);
+    if (assigned) return assigned[1];
+    const esExport = new RegExp(`export\\s*\\{[^}]*\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${esc}\\b`).exec(text);
+    if (esExport) return esExport[1];
+    return exportName;
   }
 
   private static extractVariableRequires(text: string, filePath: string): Map<string, string> {

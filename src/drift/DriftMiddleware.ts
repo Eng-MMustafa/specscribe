@@ -1,6 +1,7 @@
 /** SpecScribe | Developed by Mohamed Mustafa | MIT License **/
 import { Buffer } from 'buffer';
-import { Inject, Injectable, NestMiddleware } from '@nestjs/common';
+import { Inject, Injectable, NestMiddleware, Optional } from '@nestjs/common';
+import { getRuntimeGlobalPrefix, getRuntimeVersioning, liveSpec } from '../utils/LiveSpec';
 import { SpecScribeLogger } from '../utils/SpecScribeLogger';
 import { checkDrift, DriftFinding } from './DriftDetector';
 
@@ -29,7 +30,28 @@ export class DriftMiddleware implements NestMiddleware {
   /** Recent findings, newest first, bounded. */
   static readonly findings: DriftFinding[] = [];
 
-  constructor(@Inject('SPECSCRIBE_OPENAPI') private readonly spec: any) {}
+  constructor(
+    @Inject('SPECSCRIBE_OPENAPI') private readonly spec: any,
+    @Optional() @Inject('SPECSCRIBE_OPTIONS') private readonly options?: any,
+  ) {}
+
+  private liveKey = '';
+  private live: any;
+
+  /** The document with the app's real prefix and URI version — what requests hit. */
+  private currentSpec(): any {
+    const key = `${getRuntimeGlobalPrefix()}|${JSON.stringify(getRuntimeVersioning() ?? null)}`;
+    if (key !== this.liveKey || !this.live) {
+      this.liveKey = key;
+      this.live = liveSpec(this.spec, {
+        optionPrefix: this.options?.globalPrefix,
+        runtimePrefix: getRuntimeGlobalPrefix(),
+        explicitBaseUrl: true,
+        versioning: getRuntimeVersioning(),
+      });
+    }
+    return this.live;
+  }
 
   use(req: any, res: any, next: any) {
     const path = this.requestPath(req);
@@ -97,7 +119,7 @@ export class DriftMiddleware implements NestMiddleware {
       return;
     }
 
-    const issues = checkDrift(this.spec, method, path, res.statusCode, body);
+    const issues = checkDrift(this.currentSpec(), method, path, res.statusCode, body);
     if (issues.length === 0) return;
 
     const fresh = issues.filter(issue => {

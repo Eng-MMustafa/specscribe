@@ -6,6 +6,7 @@
  * with a protocol-invalid body.
  */
 import { MOCK_GLOBAL_PREFIX, MockMiddleware } from '../src/middleware/MockMiddleware';
+import { setRuntimeVersioning } from '../src/utils/LiveSpec';
 import { ControllerInfo, MethodInfo } from '../src/scanner/ScannerService';
 import { AnalyzedType } from '../src/utils/DtoAnalyzer';
 
@@ -284,14 +285,12 @@ describe('MockMiddleware', () => {
       expect(res.statusCode).toBe(200);
     });
 
-    it('does not answer on the unprefixed path when a prefix is configured', () => {
-      const { res } = invoke(
-        [controller('accounts', [method({ name: 'list', httpMethod: 'GET', route: '' })])],
-        { path: '/specscribe-mock/accounts', method: 'GET' },
-        'api',
-      );
-
-      expect(res.statusCode).toBe(404);
+    it('answers on the clean <prefix>/specscribe-mock/<route> form and the 1.0 doubled form', () => {
+      const controllers = [controller('accounts', [method({ name: 'list', httpMethod: 'GET', route: '' })])];
+      for (const path of ['/api/specscribe-mock/accounts', '/api/specscribe-mock/api/accounts']) {
+        expect(invoke(controllers, { path, method: 'GET' }, 'api').res.statusCode).toBe(200);
+      }
+      expect(invoke(controllers, { path: '/api/specscribe-mock/nope', method: 'GET' }, 'api').res.statusCode).toBe(404);
     });
 
     it('handles nested method routes', () => {
@@ -318,5 +317,50 @@ describe('MOCK_GLOBAL_PREFIX token', () => {
   it('is optional so the middleware works without it', () => {
     expect(() => new MockMiddleware([])).not.toThrow();
     expect(MOCK_GLOBAL_PREFIX).toBeTruthy();
+  });
+});
+
+describe('MockMiddleware with URI versioning (app.enableVersioning)', () => {
+  const list = method({ name: 'list', httpMethod: 'GET', route: '', returnType: objectType('list') });
+  const v2 = method({ name: 'v2', httpMethod: 'GET', route: 'all', version: '2', returnType: objectType('v2') });
+  const users = [controller('users', [list, v2])];
+  const run = (path: string) => invoke(users, { path, method: 'GET' }, 'api');
+
+  afterEach(() => setRuntimeVersioning(undefined));
+
+  it('answers <prefix>/specscribe-mock/<version>/<route>, with the version optional', () => {
+    setRuntimeVersioning({ enabled: true, defaults: ['1'], prefix: 'v' });
+    expect(markerOf(run('/api/specscribe-mock/v1/users').res.body)).toBe('list');
+    expect(markerOf(run('/api/specscribe-mock/users').res.body)).toBe('list');
+    expect(markerOf(run('/api/specscribe-mock/v2/users/all').res.body)).toBe('v2');
+    // 1.0 form (prefix repeated) still works.
+    expect(markerOf(run('/api/specscribe-mock/api/v1/users').res.body)).toBe('list');
+  });
+
+  it('does not answer a version the route does not carry', () => {
+    setRuntimeVersioning({ enabled: true, defaults: ['1'], prefix: 'v' });
+    expect(run('/api/specscribe-mock/v1/users/all').res.statusCode).toBe(404);
+    expect(run('/api/specscribe-mock/v3/users').res.statusCode).toBe(404);
+  });
+
+  it('honours a custom version prefix and several default versions', () => {
+    setRuntimeVersioning({ enabled: true, defaults: ['1', '2'], prefix: 'version-' });
+    expect(markerOf(run('/api/specscribe-mock/version-1/users').res.body)).toBe('list');
+    expect(markerOf(run('/api/specscribe-mock/version-2/users').res.body)).toBe('list');
+  });
+
+  it('ignores @Version() when versioning is off, like Nest does', () => {
+    setRuntimeVersioning({ enabled: false, defaults: [], prefix: 'v' });
+    expect(markerOf(run('/api/specscribe-mock/users/all').res.body)).toBe('v2');
+  });
+
+  it('recompiles when the app configures versioning after the middleware exists', () => {
+    const middleware = new MockMiddleware(users, 'api');
+    setRuntimeVersioning({ enabled: true, defaults: ['3'], prefix: 'v' });
+    let body: unknown;
+    middleware.use({ originalUrl: '/api/specscribe-mock/v3/users', method: 'GET' }, {
+      set statusCode(_c: number) { /* noop */ }, setHeader() { /* noop */ }, end(chunk: string) { body = JSON.parse(chunk); },
+    }, () => undefined);
+    expect(markerOf(body)).toBe('list');
   });
 });

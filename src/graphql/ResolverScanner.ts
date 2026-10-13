@@ -9,6 +9,7 @@ import {
   getDecorators,
   getJsDocInfo,
   objectPropertyInitializer,
+  staticString,
 } from '../analysis/AstHelpers';
 import { AnalyzedType, DtoAnalyzer } from '../utils/DtoAnalyzer';
 import { analyzedTypeToWsSchema } from '../websocket/GatewayScanner';
@@ -116,7 +117,8 @@ export class ResolverScanner {
   private extractResolverType(decorator: ts.Decorator): string {
     const first = getDecoratorArguments(decorator)[0];
     if (!first) return '';
-    if (ts.isStringLiteral(first)) return first.text;
+    const literal = staticString(first);
+    if (literal !== undefined) return literal;
     if (ts.isArrowFunction(first) && ts.isIdentifier(first.body)) return first.body.text;
     return '';
   }
@@ -158,7 +160,8 @@ export class ResolverScanner {
     for (const arg of getDecoratorArguments(decorator)) {
       if (!ts.isObjectLiteralExpression(arg)) continue;
       const initializer = objectPropertyInitializer(arg, 'name');
-      if (initializer && ts.isStringLiteral(initializer)) return initializer.text;
+      const name = staticString(initializer);
+      if (name !== undefined) return name;
     }
     return undefined;
   }
@@ -173,7 +176,11 @@ export class ResolverScanner {
       if (!argsDecorator) continue;
 
       const decoratorArgs = getDecoratorArguments(argsDecorator);
-      const nameArg = decoratorArgs.find((arg): arg is ts.StringLiteral => ts.isStringLiteral(arg));
+      // `@Args('id')` or `@Args(ARG.ID)`; the options object is not a name.
+      const nameArg = decoratorArgs
+        .filter((arg) => !ts.isObjectLiteralExpression(arg))
+        .map((arg) => staticString(arg))
+        .find((value): value is string => value !== undefined);
       const optionsArg = decoratorArgs.find((arg): arg is ts.ObjectLiteralExpression =>
         ts.isObjectLiteralExpression(arg),
       );
@@ -187,7 +194,7 @@ export class ResolverScanner {
       args.push({
         // `@Args('id')` names one argument; a bare `@Args()` binds a whole
         // args DTO, in which case the parameter name is the best label.
-        name: nameArg ? nameArg.text : param.name.getText(),
+        name: nameArg ?? param.name.getText(),
         type: analyzer.analyzeType(analyzer.typeOf(param)),
         isOptional,
       });

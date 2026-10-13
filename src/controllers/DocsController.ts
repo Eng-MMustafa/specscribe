@@ -10,12 +10,13 @@ import {
   SetMetadata,
   Type,
   UnauthorizedException,
+  VERSION_NEUTRAL,
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { renderDocsPage } from '../utils/DocsPageRenderer';
 import { buildScenarioDocument } from '../runner/ScenarioDocument';
 import { SpecScribeLogger } from '../utils/SpecScribeLogger';
-import { getRuntimeGlobalPrefix, liveSpec, requestOrigin } from '../utils/LiveSpec';
+import { getRuntimeGlobalPrefix, getRuntimeVersioning, liveSpec, requestOrigin } from '../utils/LiveSpec';
 
 export const IS_PUBLIC_KEY = 'isPublic';
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
@@ -39,7 +40,9 @@ export function normalizeDocsPath(path: string | undefined): string {
 export function createDocsController(config: { path?: string } = {}): Type<any> {
   const docsPath = normalizeDocsPath(config.path);
 
-  @Controller()
+  // Version-neutral: with URI versioning the docs stay at <prefix>/docs instead
+  // of moving under the app's defaultVersion (e.g. /api/v1/docs).
+  @Controller({ version: VERSION_NEUTRAL })
   @Public()
   class DocsController {
     constructor(
@@ -105,7 +108,7 @@ export function createDocsController(config: { path?: string } = {}): Type<any> 
      */
     private specFor(req: Request): any {
       const origin = this.options?.baseUrlExplicit ? undefined : requestOrigin(req as any);
-      const key = `${origin ?? ''}|${getRuntimeGlobalPrefix()}`;
+      const key = `${origin ?? ''}|${getRuntimeGlobalPrefix()}|${JSON.stringify(getRuntimeVersioning() ?? null)}`;
       let cached = this.liveCache.get(key);
       if (!cached) {
         cached = liveSpec(this.openApiSpec, {
@@ -114,6 +117,7 @@ export function createDocsController(config: { path?: string } = {}): Type<any> 
           explicitBaseUrl: !!this.options?.baseUrlExplicit,
           origin,
           mockEnabled: !!this.options?.enableMock,
+          versioning: getRuntimeVersioning(),
         });
         if (this.liveCache.size > 20) this.liveCache.clear();
         this.liveCache.set(key, cached);

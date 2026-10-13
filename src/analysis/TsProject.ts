@@ -2,6 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
+import { setStaticChecker } from './AstHelpers';
 import { resolveExistingPathWithinRoot } from '../utils/PathSecurity';
 
 /**
@@ -113,7 +114,10 @@ export class TsProject {
   }
 
   getChecker(): ts.TypeChecker {
-    return this.getProgram().getTypeChecker();
+    const checker = this.getProgram().getTypeChecker();
+    // Decorator readers resolve constants (`EVENTS.JOIN`) through it.
+    setStaticChecker(checker);
+    return checker;
   }
 
   private getProgram(): ts.Program {

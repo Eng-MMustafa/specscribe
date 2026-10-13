@@ -58,3 +58,43 @@ describe('requestOrigin', () => {
     expect(requestOrigin({ headers: { host: '[::1]:3000' } })).toBe('http://[::1]:3000');
   });
 });
+
+describe('liveSpec with URI versioning', () => {
+  // Built the way forRoot() builds it: paths carry how they were made.
+  const meta = (rest: string, version?: string[]) => ({ 'x-specscribe-route': version ? { rest, version } : { rest } });
+  const doc: Doc = {
+    paths: {
+      '/users': { get: { operationId: 'list' }, ...meta('/users') },
+      '/v2/users/all': { get: { operationId: 'v2' }, ...meta('/users/all', ['2']) },
+      '/health': { get: { operationId: 'health' }, ...meta('/health', ['']) },
+    },
+  };
+  const on = { enabled: true, defaults: ['1'], prefix: 'v' };
+
+  it('gives unversioned routes the defaultVersion, keeps explicit and neutral ones', () => {
+    const out = liveSpec(doc, { runtimePrefix: 'api', versioning: on, mockEnabled: true });
+    expect(Object.keys(out.paths!).sort()).toEqual(['/api/health', '/api/v1/users', '/api/v2/users/all']);
+    expect(out['x-specscribe-mock']).toBe('/api/specscribe-mock');
+    expect(out['x-specscribe-prefix']).toBe('/api');
+  });
+
+  it('never leaks the internal route record', () => {
+    const out = liveSpec(doc, { versioning: on });
+    for (const item of Object.values(out.paths!)) expect(item).not.toHaveProperty('x-specscribe-route');
+  });
+
+  it('documents a route once per default version, with a custom prefix', () => {
+    const out = liveSpec(doc, { versioning: { enabled: true, defaults: ['1', '2'], prefix: 'version-' } });
+    expect(Object.keys(out.paths!)).toEqual(expect.arrayContaining(['/version-1/users', '/version-2/users', '/version-2/users/all']));
+  });
+
+  it('drops version segments when versioning is off (Nest ignores @Version)', () => {
+    const out = liveSpec(doc, { optionPrefix: 'api', versioning: { enabled: false, defaults: [], prefix: 'v' } });
+    expect(Object.keys(out.paths!).sort()).toEqual(['/api/health', '/api/users', '/api/users/all']);
+  });
+
+  it('keeps explicit versions when the app is not running (no runtime facts)', () => {
+    const out = liveSpec(doc, { optionPrefix: 'api' });
+    expect(Object.keys(out.paths!).sort()).toEqual(['/api/health', '/api/users', '/api/v2/users/all']);
+  });
+});

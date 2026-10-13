@@ -19,6 +19,7 @@ import { AutoDetector, Framework } from '../utils/AutoDetector';
 import { ScannerService } from '../scanner/ScannerService';
 import { typeScriptSupport } from '../analysis/TypeScriptSupport';
 import { OpenApiTransformer } from '../utils/OpenApiTransformer';
+import { liveSpec, RuntimeVersioning, versionSegment } from '../utils/LiveSpec';
 import { ExpressScanner } from '../express/ExpressScanner';
 import { ExpressOpenApiTransformer } from '../express/ExpressOpenApiTransformer';
 import { ExpressWebSocketScanner } from '../express/ExpressWebSocketScanner';
@@ -131,6 +132,11 @@ export class StandaloneDocsServer {
     }
     const globalPrefix = framework === 'nestjs' ? this.detectGlobalPrefix(sourcePath) : '';
     if (globalPrefix) SpecScribeLogger.info(`Global prefix: /${globalPrefix}`);
+    const versioning = framework === 'nestjs' ? this.detectVersioning(sourcePath) : undefined;
+    if (versioning?.enabled) {
+      const list = versioning.defaults.map((v) => versionSegment(v, versioning) || 'neutral').join(', ') || 'none';
+      SpecScribeLogger.info(`URI versioning: default ${list}`);
+    }
 
     const title = options.title || detector.packageJson.name || (framework === 'nestjs' ? AutoDetector.getAppName(detector.rootPath) : 'Express API');
     const version = options.version || detector.packageJson.version || AutoDetector.getAppVersion(detector.rootPath);
@@ -142,7 +148,10 @@ export class StandaloneDocsServer {
 
     if (framework === 'nestjs') {
       const controllers = new ScannerService().scanControllers(sourcePath);
-      spec = new OpenApiTransformer(baseUrl, globalPrefix, options.openApiVersion).transform(controllers, title, version, baseUrl);
+      const transformer = new OpenApiTransformer(baseUrl, globalPrefix, options.openApiVersion);
+      transformer.includeRouteMeta = true;
+      // Same rebuild as the Nest module: real prefix + URI version, record stripped.
+      spec = liveSpec(transformer.transform(controllers, title, version, baseUrl) as unknown as Record<string, unknown>, { optionPrefix: globalPrefix, explicitBaseUrl: true, versioning });
       const tsSupport = typeScriptSupport();
       if (!tsSupport.ok) spec.info.description = tsSupport.message;
 
@@ -500,6 +509,41 @@ export class StandaloneDocsServer {
       }));
     });
     req.pipe(upstream);
+  }
+
+  /**
+   * `app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' })`
+   * from the Nest bootstrap file. `enableVersioning()` alone means URI
+   * versioning; header / media-type / custom versioning leave paths alone.
+   */
+  private static detectVersioning(sourcePath: string): RuntimeVersioning | undefined {
+    const candidates = ['main.ts', 'main.js', 'app.ts', 'server.ts', 'index.ts'].map((f) => path.join(path.resolve(sourcePath), f));
+    for (const file of candidates) {
+      let text: string;
+      try {
+        text = fs.readFileSync(file, 'utf-8');
+      } catch {
+        continue;
+      }
+      const at = text.search(/\.enableVersioning\s*\(/);
+      if (at === -1) continue;
+      const open = text.indexOf('(', at);
+      let depth = 0;
+      let close = open;
+      for (; close < text.length; close++) {
+        if (text[close] === '(') depth++;
+        else if (text[close] === ')' && --depth === 0) break;
+      }
+      const args = text.slice(open + 1, close);
+      const type = /type\s*:\s*VersioningType\.(\w+)/.exec(args)?.[1] ?? 'URI';
+      if (type !== 'URI') return { enabled: false, defaults: [], prefix: 'v' };
+      const raw = /defaultVersion\s*:\s*(\[[^\]]*\]|['"`][^'"`]*['"`]|VERSION_NEUTRAL)/.exec(args)?.[1] ?? '';
+      const defaults = [...raw.matchAll(/['"`]([^'"`]*)['"`]|VERSION_NEUTRAL/g)].map((m) => m[1] ?? '');
+      const prefixMatch = /prefix\s*:\s*(false|['"`]([^'"`]*)['"`])/.exec(args);
+      const prefix = !prefixMatch ? 'v' : prefixMatch[1] === 'false' ? '' : prefixMatch[2];
+      return { enabled: true, defaults, prefix };
+    }
+    return undefined;
   }
 
   /** `app.setGlobalPrefix('api')` from the Nest bootstrap file, if any. */

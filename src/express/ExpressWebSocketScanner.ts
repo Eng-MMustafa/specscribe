@@ -2,7 +2,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { friendlyNames } from './ExpressNaming';
-import { balancedSlice, matchBracket, objectEntries, splitTopLevel, stripComments } from './ExpressLexical';
+import { balancedSlice, isStringLiteral, matchBracket, objectEntries, splitTopLevel, stripComments, unquote } from './ExpressLexical';
+import { ExpressSymbolRegistry } from './ExpressSymbolRegistry';
 import { ExpressResponseInference } from './ExpressResponseInference';
 
 export type WsTransport = 'socket.io' | 'ws';
@@ -37,6 +38,19 @@ const IGNORED_EVENTS = new Set(['connection', 'disconnect', 'disconnecting', 'co
 const CALLBACK_NAMES = /^(cb|callback|ack|ackFn|done|respond|reply|fn|next)$/i;
 
 /**
+ * The block comment that ends `text`, if any: the closest one — not a match
+ * starting at the first comment of the file, which swallowed every comment in
+ * between and gave every event the same summary.
+ */
+function lastBlockComment(text: string): [string, string] | null {
+  const trimmed = text.replace(/\s+$/, '');
+  if (!trimmed.endsWith('*/')) return null;
+  const start = trimmed.lastIndexOf('/*', trimmed.length - 3);
+  if (start === -1) return null;
+  return [trimmed.slice(start), trimmed.slice(start + 2, -2).replace(/^\*/, '')];
+}
+
+/**
  * Heuristic scanner for Socket.IO events in Express/Node.js projects.
  *
  * It looks for `socket.on('eventName', handler)` calls and groups them as one
@@ -53,6 +67,8 @@ export class ExpressWebSocketScanner {
     const files = this.collectFiles(absolutePath);
     const texts = new Map(files.map((file) => [file, this.read(file)]));
     const transport = this.detectTransport([...texts.values()]);
+    // Event names and namespaces are often constants (`socket.on(EVENTS.JOIN, …)`).
+    const registry = new ExpressSymbolRegistry(absolutePath);
     const found: { file: string; events: ExpressWebSocketEvent[]; namespace?: string }[] = [];
 
     for (const [file, raw] of texts) {
@@ -60,8 +76,9 @@ export class ExpressWebSocketScanner {
       // `socket.on('message')` inside a plain-WebSocket route is not Socket.IO.
       if (/\bwebsocket\s*:\s*true\b|\bupgradeWebSocket\s*\(/.test(raw) && !/\bio\s*\.\s*(?:on|of)\s*\(/.test(raw)) continue;
       const text = stripComments(raw);
-      const events = this.extractEvents(raw, text);
-      if (events.length > 0) found.push({ file, events, namespace: this.namespaceOf(text) });
+      const resolve = (expr: string) => registry.resolveString(expr, file);
+      const events = this.extractEvents(raw, text, resolve);
+      if (events.length > 0) found.push({ file, events, namespace: this.namespaceOf(text, resolve) });
     }
 
     // `websocket/orders.gateway.js` reads as `OrdersGateway`, like a Nest gateway.
@@ -155,7 +172,7 @@ export class ExpressWebSocketScanner {
     if (at === -1) return undefined;
     const lineStart = raw.lastIndexOf('\n', at) + 1;
     const before = raw.slice(0, lineStart).replace(/[ \t]+$/, '').replace(/\s+$/, '');
-    const block = /\/\*\*?([\s\S]*?)\*\/$/.exec(before);
+    const block = lastBlockComment(before);
     if (block) {
       const line = block[1].split('\n').map((l) => l.replace(/^\s*\*\s?/, '').trim()).find((l) => l && !l.startsWith('@'));
       if (line) return line.replace(/\s*\.$/, '');
@@ -193,11 +210,25 @@ export class ExpressWebSocketScanner {
   }
 
   /** `io.of('/orders').on('connection', …)` → `/orders`. */
-  private static namespaceOf(text: string): string | undefined {
-    const match = /\.of\s*\(\s*['"`](\/?[^'"`]+)['"`]\s*\)\s*\.on\s*\(\s*['"]connection['"]/.exec(text);
-    if (!match) return undefined;
-    return match[1].startsWith('/') ? match[1] : `/${match[1]}`;
+  /**
+   * `io.of('/chat').on('connection', …)`, and `const chat = io.of(NAMESPACE);
+   * chat.on('connection', …)` with the namespace written as a constant.
+   */
+  private static namespaceOf(text: string, resolve: (expr: string) => string | undefined = () => undefined): string | undefined {
+    const ofCall = /\.of\s*\(/g;
+    let m: RegExpExecArray | null;
+    while ((m = ofCall.exec(text)) !== null) {
+      const open = text.indexOf('(', m.index);
+      const close = matchBracket(text, open);
+      if (close === -1) continue;
+      const arg = splitTopLevel(text.slice(open + 1, close - 1), ',')[0] || '';
+      const value = isStringLiteral(arg.trim()) ? unquote(arg.trim()) : resolve(arg);
+      if (!value) continue;
+      return value.startsWith('/') ? value : `/${value}`;
+    }
+    return undefined;
   }
+
 
   private static collectFiles(dir: string, out: string[] = [], depth = 0): string[] {
     if (depth > 8) return out;
@@ -223,23 +254,29 @@ export class ExpressWebSocketScanner {
     return out;
   }
 
-  private static extractEvents(raw: string, text: string): ExpressWebSocketEvent[] {
+  private static extractEvents(
+    raw: string,
+    text: string,
+    resolve: (expr: string) => string | undefined = () => undefined,
+  ): ExpressWebSocketEvent[] {
     const events: ExpressWebSocketEvent[] = [];
     const seen = new Set<string>();
-    const eventPattern = /socket\.on\s*\(\s*['"`]([^'"`]+)['"`]\s*,/g;
+    const eventPattern = /socket\.on\s*\(/g;
 
     let match: RegExpExecArray | null;
     while ((match = eventPattern.exec(text)) !== null) {
-      const eventName = match[1];
-      if (IGNORED_EVENTS.has(eventName) || seen.has(eventName)) continue;
-      seen.add(eventName);
       const open = text.indexOf('(', match.index);
       const close = matchBracket(text, open);
       const args = close === -1 ? [] : splitTopLevel(text.slice(open + 1, close - 1), ',');
+      const nameArg = (args[0] || '').trim();
+      // `'join'` or a constant: `EVENTS.JOIN`, `EVENTS['JOIN']`, `\`${NS}:join\``.
+      const eventName = isStringLiteral(nameArg) ? unquote(nameArg) : resolve(nameArg);
+      if (!eventName || args.length < 2 || IGNORED_EVENTS.has(eventName) || seen.has(eventName)) continue;
+      seen.add(eventName);
       const handler = (args[1] || '').trim();
       events.push({
         event: eventName,
-        summary: this.commentAbove(raw, eventName) || `Handle ${eventName}`,
+        summary: this.commentAbove(raw, nameArg) || `Handle ${eventName}`,
         ...this.analyzeHandler(handler),
       });
     }
@@ -247,13 +284,13 @@ export class ExpressWebSocketScanner {
     return events;
   }
 
-  /** A line or JSDoc comment directly above `socket.on('event'`. */
-  private static commentAbove(raw: string, eventName: string): string | undefined {
-    const escaped = eventName.replace(/[.*+?^$()|[\]\\{}]/g, (c) => `\\${c}`);
-    const at = raw.search(new RegExp(`socket\\.on\\s*\\(\\s*['"\`]${escaped}['"\`]`));
+  /** A line or JSDoc comment directly above `socket.on(<nameArg>` (a literal or a constant). */
+  private static commentAbove(raw: string, nameArg: string): string | undefined {
+    const escaped = nameArg.replace(/[.*+?^$()|[\]\\{}]/g, (c) => `\\${c}`).replace(/\s+/g, '\\s*');
+    const at = raw.search(new RegExp(`socket\\.on\\s*\\(\\s*${escaped}`));
     if (at === -1) return undefined;
     const before = raw.slice(0, at).replace(/[ \t]+$/, '');
-    const block = /\/\*\*?([\s\S]*?)\*\/\s*$/.exec(before);
+    const block = lastBlockComment(before);
     if (block) {
       const line = block[1].split('\n').map((l) => l.replace(/^\s*\*\s?/, '').trim()).find((l) => l && !l.startsWith('@'));
       if (line) return line.replace(/\s*\.$/, '');

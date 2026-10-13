@@ -1,6 +1,6 @@
 {
   "name": "specscribe",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zero-config API documentation for NestJS, Express, Fastify and Hono: OpenAPI docs, live REST/WebSocket/GraphQL consoles, mock server, Postman export and typed SDKs from static analysis — no decorators, no setup",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

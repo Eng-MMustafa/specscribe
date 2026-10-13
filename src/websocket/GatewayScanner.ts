@@ -9,6 +9,8 @@ import {
   getDecorators,
   getJsDocInfo,
   numericLiteralValue,
+  staticString,
+  staticValue,
 } from '../analysis/AstHelpers';
 import { AnalyzedType, DtoAnalyzer } from '../utils/DtoAnalyzer';
 import { resolveSourcePath } from '../scanner/ScannerService';
@@ -125,7 +127,7 @@ export class GatewayScanner {
     let port: number | undefined;
 
     for (const arg of args) {
-      const numeric = numericLiteralValue(arg);
+      const numeric = numericLiteralValue(arg) ?? (typeof staticValue(arg) === 'number' ? (staticValue(arg) as number) : undefined);
       if (numeric !== undefined) {
         port = numeric;
         continue;
@@ -133,9 +135,9 @@ export class GatewayScanner {
       if (ts.isObjectLiteralExpression(arg)) {
         for (const prop of arg.properties) {
           if (!ts.isPropertyAssignment(prop)) continue;
-          if (prop.name.getText() === 'namespace' && ts.isStringLiteral(prop.initializer)) {
-            namespace = prop.initializer.text;
-          }
+          // Literal or constant: `namespace: '/chat'` / `namespace: NAMESPACES.CHAT`.
+          const value = prop.name.getText() === 'namespace' ? staticString(prop.initializer) : undefined;
+          if (value !== undefined) namespace = value;
         }
       }
     }
@@ -155,9 +157,16 @@ export class GatewayScanner {
     );
     if (!subscribe) return null;
 
-    const args = getDecoratorArguments(subscribe);
-    const first = args[0];
-    if (!first || !ts.isStringLiteral(first)) return null;
+    // `@SubscribeMessage('join')` and constants: `EVENTS.JOIN`, `EVENTS['JOIN']`,
+    // enums, imported/aliased consts, templates. Only runtime-computed names are skipped.
+    const nameArg = getDecoratorArguments(subscribe)[0];
+    const eventName = staticString(nameArg);
+    if (eventName === undefined) {
+      SpecScribeLogger.debug(
+        `Skipping @SubscribeMessage(${nameArg?.getText() ?? ''}) on ${method.name.getText()}: the event name is only known at runtime`,
+      );
+      return null;
+    }
 
     // The payload is the `@MessageBody()` parameter. Without the decorator the
     // first non-socket parameter is the best available guess.
@@ -174,7 +183,7 @@ export class GatewayScanner {
     const [firstLine, ...rest] = (text || '').split('\n');
 
     return {
-      event: first.text,
+      event: eventName,
       methodName: method.name.getText(),
       payloadType: payloadParam ? analyzer.analyzeType(analyzer.typeOf(payloadParam)) : undefined,
       returnType: analyzer.analyzeType(analyzer.returnTypeOf(method)),

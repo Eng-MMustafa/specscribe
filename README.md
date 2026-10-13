@@ -58,7 +58,7 @@ npx specscribe init        # adds the single line below to app.module.ts
 export class AppModule {}
 ```
 
-Start your app as usual; the banner prints the docs link. The global prefix (`app.setGlobalPrefix('api')`), host and port are read from the running app, so every link, "Try it" call and mock response is correct on any port. Docs and mock are **off in production** unless you opt in.
+Start your app as usual; the banner prints the docs link. The global prefix (`app.setGlobalPrefix('api')`), URI versioning (`app.enableVersioning({ defaultVersion: '1' })`), host and port are read from the running app, so every link, "Try it" call and mock response is correct on any port. Docs stay at `<prefix>/docs` whatever the API version, and are **off in production** unless you opt in.
 
 ---
 
@@ -137,13 +137,13 @@ The scanner reads your TypeScript AST (NestJS) or route files (Express, Fastify,
 
 | | NestJS | Express · Fastify · Hono |
 |---|---|---|
-| **Routes** | `@Controller` + verb decorators, versioning, global prefix | `app.get/post/…`, routers, `app.use()` mounts, `route()` chains, Fastify plugins |
+| **Routes** | `@Controller` + verb decorators, `@Version` / `defaultVersion` (URI), global prefix — literals or constants (`@Controller(ROUTES.USERS)`) | `app.get/post/…`, routers, `app.use()` mounts, `route()` chains, Fastify plugins |
 | **Request bodies** | DTO classes, `class-validator` rules, `nestjs-zod`, inheritance, generics | Zod, Joi, Yup, express-validator, TypeScript types, `req.body` destructuring |
 | **Responses** | Return types, `@HttpCode`, `throw new NotFoundException(…)` | `res.status(…).json(…)` literals, values followed back to your data |
 | **Uploads** | `FileInterceptor` / `FilesInterceptor` fields | multer `single` / `array` / `fields` field names |
 | **Auth** | Guards → bearer / API key | auth middleware → bearer |
 | **Names** | JSDoc, method names | JSDoc, handler names, REST-style fallbacks, short `operationId`s |
-| **Realtime** | `@WebSocketGateway`, `@SubscribeMessage`, `WsAdapter` | Socket.IO events, `@fastify/websocket`, Hono `upgradeWebSocket` |
+| **Realtime** | `@WebSocketGateway`, `@SubscribeMessage` (also `EVENTS.JOIN`, enums, templates), `WsAdapter` | Socket.IO events, `@fastify/websocket`, Hono `upgradeWebSocket` |
 | **GraphQL** | `@Resolver`, `@Query`, `@Mutation`, `@Subscription` | SDL from Apollo, graphql-yoga, Mercurius, `@hono/graphql-server` |
 | **Hints** | `@nestjs/swagger` decorators when present — never required | — |
 
@@ -153,7 +153,7 @@ The scanner reads your TypeScript AST (NestJS) or route files (Express, Fastify,
 
 ```bash
 # A spec-driven mock server for every documented route (on by default in development)
-curl http://localhost:3000/specscribe-mock/users/1
+curl http://localhost:3000/specscribe-mock/users/1        # with a prefix and URI versioning: /api/specscribe-mock/v1/users/1
 
 # SDKs and collections from the same scan
 npx specscribe generate --format client -o api-client.ts       # typed TypeScript client

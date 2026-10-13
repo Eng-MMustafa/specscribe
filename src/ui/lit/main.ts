@@ -119,6 +119,8 @@ interface SpecDoc {
   'x-specscribe-proxy'?: string;
   /** Path (on the docs page origin) of the spec-driven mock server. */
   'x-specscribe-mock'?: string;
+  /** The app's global prefix (`/api`): part of the mock base, so not repeated in mock URLs. */
+  'x-specscribe-prefix'?: string;
 }
 
 type View = 'overview' | 'rest' | 'ws' | 'gql' | 'scenario';
@@ -1480,6 +1482,19 @@ export class SpecScribeDocs extends LitElement {
     return typeof prefix === 'string' ? prefix.replace(/\/+$/, '') : '';
   }
 
+  /**
+   * The mock URL for a documented path: `/api/v1/users` → `/api/specscribe-mock/v1/users`.
+   * The app's global prefix (`x-specscribe-prefix`) is already part of the mock
+   * base, so it is not repeated.
+   */
+  private mockUrl(path: string): string {
+    const strip = this.spec?.['x-specscribe-prefix'];
+    const rest = typeof strip === 'string' && strip && (path === strip || path.startsWith(`${strip}/`))
+      ? path.slice(strip.length) || '/'
+      : path;
+    return location.origin + this.mockPrefix() + rest;
+  }
+
   private setMockMode(on: boolean): void {
     this.mockMode = on;
     try { localStorage.setItem(MOCK_KEY, on ? '1' : '0'); } catch { /* ignore */ }
@@ -1489,7 +1504,7 @@ export class SpecScribeDocs extends LitElement {
   private requestTarget(op: OperationInfo): { display: string; fetchUrl: string; mock: boolean } {
     if (this.mockMode) {
       const prefix = this.mockPrefix();
-      const display = prefix ? location.origin + prefix + this.requestPath(op) : this.requestUrl(op);
+      const display = prefix ? this.mockUrl(this.requestPath(op)) : this.requestUrl(op);
       return { display, fetchUrl: prefix ? display : '', mock: true };
     }
     const display = this.requestUrl(op);
@@ -1636,7 +1651,7 @@ export class SpecScribeDocs extends LitElement {
       this.responseNote = reason;
       if (prefix) {
         try {
-          const res = await fetch(location.origin + prefix + this.requestPath(op), { method: op.method });
+          const res = await fetch(this.mockUrl(this.requestPath(op)), { method: op.method });
           if (res.status !== 404) {
             this.applyResponse(res.status, headersOf(res), await res.text());
             return;
@@ -2267,7 +2282,7 @@ export class SpecScribeDocs extends LitElement {
     const vars = await runScenario(scenario, this.allVars(), {
       send: async (method, path, headers, body) => {
         const mock = this.mockMode && !!prefix;
-        const display = mock ? location.origin + prefix + path : this.baseUrl().replace(/\/+$/, '') + path;
+        const display = mock ? this.mockUrl(path) : this.baseUrl().replace(/\/+$/, '') + path;
         if (!Object.keys(headers).some(k => k.toLowerCase() === 'authorization')) {
           Object.assign(headers, this.authHeadersFor(display, this.globalAuth));
         }

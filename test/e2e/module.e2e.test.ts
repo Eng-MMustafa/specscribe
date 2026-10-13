@@ -232,9 +232,9 @@ describe('SpecScribeModule (e2e)', () => {
       expect(status).toBe(200);
     });
 
-    it('does not serve the mock on the unprefixed path', async () => {
-      const res = await fetch(`${baseUrl}/specscribe-mock/users/1`);
-      expect(res.status).toBe(404);
+    it('serves the clean mock URL (prefix not repeated) and rejects unknown routes', async () => {
+      expect((await fetch(`${baseUrl}/specscribe-mock/users/1`)).status).toBe(200);
+      expect((await fetch(`${baseUrl}/specscribe-mock/api/nope/1`)).status).toBe(404);
     });
   });
 

@@ -5,6 +5,8 @@ import {
   getDecoratorName,
   getDecorators,
   objectPropertyInitializer,
+  staticString,
+  staticValue,
 } from '../analysis/AstHelpers';
 
 /**
@@ -30,13 +32,14 @@ const FALLBACK_FIELD = 'file';
 /** Reads a string literal argument. */
 function stringArg(args: readonly ts.Expression[], index: number): string | undefined {
   const arg = args[index];
-  return arg && ts.isStringLiteral(arg) ? arg.text : undefined;
+  return arg ? staticString(arg) : undefined;
 }
 
 /** Reads a numeric literal argument. */
 function numberArg(args: readonly ts.Expression[], index: number): number | undefined {
   const arg = args[index];
-  return arg && ts.isNumericLiteral(arg) ? Number(arg.text) : undefined;
+  const value = arg ? staticValue(arg) : undefined;
+  return typeof value === 'number' ? value : undefined;
 }
 
 /**
@@ -52,13 +55,15 @@ function parseFileFieldsArray(args: readonly ts.Expression[]): FileFieldInfo[] {
     if (!ts.isObjectLiteralExpression(element)) continue;
 
     const nameInit = objectPropertyInitializer(element, 'name');
-    if (!nameInit || !ts.isStringLiteral(nameInit)) continue;
+    const name = nameInit ? staticString(nameInit) : undefined;
+    if (name === undefined) continue;
 
     const maxInit = objectPropertyInitializer(element, 'maxCount');
-    const maxCount = maxInit && ts.isNumericLiteral(maxInit) ? Number(maxInit.text) : undefined;
+    const maxValue = maxInit ? staticValue(maxInit) : undefined;
+    const maxCount = typeof maxValue === 'number' ? maxValue : undefined;
 
     fields.push({
-      name: nameInit.text,
+      name,
       // A field declared with maxCount > 1 accepts an array of files.
       multiple: maxCount === undefined ? false : maxCount > 1,
       maxCount,

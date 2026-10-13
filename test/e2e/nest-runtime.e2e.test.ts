@@ -62,3 +62,48 @@ describe(`NestJS ${installedNest().version} in a real Node process`, () => {
     });
   }
 });
+
+/**
+ * Global prefix + URI versioning (`defaultVersion: '1'`), the setup from
+ * issue #3, plus constant event names and routes (issue #1).
+ */
+describe('NestJS app with URI versioning (real process)', () => {
+  const versioned = path.join(__dirname, 'versioned-smoke', 'app.cjs');
+  const bootVersioned = (adapter: string, mode: string) => {
+    const run = spawnSync(process.execPath, [versioned, adapter, mode], { encoding: 'utf8', timeout: 90_000 });
+    const line = (run.stdout || '').trim().split('\n').pop() || '{}';
+    const result = JSON.parse(line);
+    if (result.error) throw new Error(result.error);
+    return result;
+  };
+
+  for (const adapter of ['express', 'fastify']) {
+    for (const mode of ['zero', 'explicit']) {
+      it(`documents and mocks the versioned routes on ${adapter} (${mode === 'zero' ? 'forRoot()' : "globalPrefix: 'api'"})`, () => {
+        const r = bootVersioned(adapter, mode === 'zero' ? '' : 'explicit');
+        expect(r).toMatchObject({
+          // Docs are version-neutral and the banner prints exactly where they are.
+          docsUrl: '/api/docs',
+          bannerDocs: '/api/docs',
+          bannerMock: '/api/specscribe-mock/v1',
+          paths: ['/api/reports', '/api/v1/users', '/api/v1/users/{id}', '/api/v2/users/all'],
+          mockBase: '/api/specscribe-mock',
+          // What the docs UI requests in Mock mode — no doubled prefix.
+          uiMockPath: '/api/specscribe-mock/v1/users',
+          uiMockStatus: 200,
+          realV1: 200,
+          wsNamespace: '/realtime',
+        });
+        expect(r.mock).toEqual({
+          '/api/specscribe-mock/v1/users': 200,
+          '/api/specscribe-mock/users': 200,
+          '/api/specscribe-mock/v1/users/7': 200,
+          '/api/specscribe-mock/v2/users/all': 200,
+          '/api/specscribe-mock/api/v1/users': 200,
+          '/api/specscribe-mock/api/users': 200,
+        });
+        expect(r.wsEvents).toHaveLength(7);
+      });
+    }
+  }
+});

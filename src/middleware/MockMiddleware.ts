@@ -9,7 +9,7 @@ import {
   paramName,
   requestSegments,
 } from '../utils/RoutePath';
-import { getRuntimeGlobalPrefix, normalizePrefix } from '../utils/LiveSpec';
+import { getRuntimeGlobalPrefix, getRuntimeVersioning, normalizePrefix, routeVersions, versionSegment } from '../utils/LiveSpec';
 
 /** Injection token carrying the prefix so the mock matches the documented paths. */
 export const MOCK_GLOBAL_PREFIX = 'SPECSCRIBE_MOCK_GLOBAL_PREFIX';
@@ -54,6 +54,8 @@ interface CompiledRoute {
   segments: string[];
   /** `true` for `@All()`, which responds to every verb. */
   matchesAnyVerb: boolean;
+  /** Version segments this route answers on (`v1`; `''` = unversioned). */
+  versions: string[];
 }
 
 @Injectable()
@@ -66,9 +68,14 @@ export class MockMiddleware implements NestMiddleware {
     @Inject('SPECSCRIBE_CONTROLLERS') private controllers: ControllerInfo[],
     @Optional() @Inject(MOCK_GLOBAL_PREFIX) private readonly globalPrefix?: string,
   ) {
-    this.compiledFor = this.effectivePrefix();
-    this.mockPrefixes = this.prefixesFor(this.compiledFor);
-    this.routes = this.compileRoutes(this.compiledFor);
+    this.compiledFor = this.runtimeKey();
+    this.mockPrefixes = this.prefixesFor(this.effectivePrefix());
+    this.routes = this.compileRoutes();
+  }
+
+  /** Everything the route table depends on that the app may set after startup. */
+  private runtimeKey(): string {
+    return `${this.effectivePrefix()}|${JSON.stringify(getRuntimeVersioning() ?? null)}`;
   }
 
   /** `globalPrefix` from forRoot(), else what `app.setGlobalPrefix()` set. */
@@ -81,12 +88,13 @@ export class MockMiddleware implements NestMiddleware {
   }
 
   use(req: any, res: any, next: any) {
-    // The app's prefix is only final once it is listening; recompile once if it moved.
+    // Prefix and versioning are only final once the app listens; recompile if they moved.
     const prefix = this.effectivePrefix();
-    if (prefix !== this.compiledFor) {
-      this.compiledFor = prefix;
+    const key = this.runtimeKey();
+    if (key !== this.compiledFor) {
+      this.compiledFor = key;
       this.mockPrefixes = this.prefixesFor(prefix);
-      this.routes = this.compileRoutes(prefix);
+      this.routes = this.compileRoutes();
     }
     const path = requestPath(req);
     const mockPrefix = this.mockPrefixes.find(p => path === p || path.startsWith(`${p}/`));
@@ -95,7 +103,12 @@ export class MockMiddleware implements NestMiddleware {
       return next();
     }
 
-    const apiPath = path.slice(mockPrefix.length) || '/';
+    let apiPath = path.slice(mockPrefix.length) || '/';
+    // 1.0 URLs repeated the global prefix after the mock segment
+    // (`/api/specscribe-mock/api/users`); they keep working.
+    if (prefix && (apiPath === `/${prefix}` || apiPath.startsWith(`/${prefix}/`))) {
+      apiPath = apiPath.slice(prefix.length + 1) || '/';
+    }
     const match = this.findMatchingRoute(apiPath, req.method);
 
     if (!match) {
@@ -121,22 +134,20 @@ export class MockMiddleware implements NestMiddleware {
    * Flattens the scanned controllers into a route table, sorted so that the most
    * specific route is considered first.
    */
-  private compileRoutes(globalPrefix: string): CompiledRoute[] {
+  private compileRoutes(): CompiledRoute[] {
     const routes: CompiledRoute[] = [];
+    const versioning = getRuntimeVersioning();
 
     for (const controller of this.controllers) {
       for (const method of controller.methods) {
+        const explicit = method.version ?? controller.version;
         routes.push({
           controller,
           method,
-          // Built through the shared helper so the mock answers on exactly the
-          // path that appears in the generated document.
-          segments: buildRouteSegments({
-            globalPrefix,
-            version: method.version || controller.version,
-            controllerPath: controller.path,
-            methodRoute: method.route,
-          }),
+          // The route without prefix or version: `<mock>/<version>/<route>`.
+          segments: buildRouteSegments({ controllerPath: controller.path, methodRoute: method.route }),
+          versions: routeVersions(explicit === undefined ? undefined : ([] as string[]).concat(explicit), versioning)
+            .map((v) => versionSegment(v, versioning)),
           matchesAnyVerb: method.httpMethod.toUpperCase() === 'ALL',
         });
       }
@@ -160,16 +171,19 @@ export class MockMiddleware implements NestMiddleware {
   ): { route: CompiledRoute; params: Record<string, string> } | null {
     const requested = requestSegments(path);
     const normalizedVerb = (verb || '').toUpperCase();
+    const candidates = this.routes.filter(
+      (route) => route.matchesAnyVerb || route.method.httpMethod.toUpperCase() === normalizedVerb,
+    );
 
-    for (const route of this.routes) {
-      if (!route.matchesAnyVerb && route.method.httpMethod.toUpperCase() !== normalizedVerb) {
-        continue;
-      }
-
+    // `/v1/users` → the route's own version; then `/users` (version omitted).
+    for (const route of candidates) {
+      const version = route.versions.find((v) => v && v === requested[0]);
+      const params = version ? this.matchSegments(route.segments, requested.slice(1)) : null;
+      if (params) return { route, params };
+    }
+    for (const route of candidates) {
       const params = this.matchSegments(route.segments, requested);
-      if (params) {
-        return { route, params };
-      }
+      if (params) return { route, params };
     }
 
     return null;

@@ -1,7 +1,10 @@
 /** SpecScribe | Developed by Mohamed Mustafa | MIT License **/
-import { DynamicModule, MiddlewareConsumer, Module, OnModuleInit, RequestMethod, Inject, Optional } from '@nestjs/common';
+import { DynamicModule, MiddlewareConsumer, Module, OnModuleInit, RequestMethod, Inject, Optional, VERSION_NEUTRAL, VersioningType } from '@nestjs/common';
 import { ApplicationConfig, HttpAdapterHost } from '@nestjs/core';
-import { getRuntimeGlobalPrefix, normalizePrefix, setRuntimeGlobalPrefix } from './utils/LiveSpec';
+import {
+  getRuntimeGlobalPrefix, getRuntimeVersioning, normalizePrefix, routeVersions, RuntimeVersioning,
+  setRuntimeGlobalPrefix, setRuntimeVersioning, versionSegment,
+} from './utils/LiveSpec';
 import { ConfigurableModuleClass, MODULE_OPTIONS_TOKEN } from './specscribe.module-definition';
 import { PostmanCollectionGenerator } from './generators/PostmanCollectionGenerator';
 import { MOCK_GLOBAL_PREFIX, MockMiddleware } from './middleware/MockMiddleware';
@@ -152,13 +155,32 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
     }
   }
 
+  /**
+   * URI versioning from `app.enableVersioning()`. Other versioning types
+   * (header, media type, custom) leave paths unchanged.
+   */
+  private detectVersioning(): RuntimeVersioning {
+    let config: any;
+    try {
+      config = this.appConfig?.getVersioning?.();
+    } catch {
+      config = undefined;
+    }
+    if (!config || config.type !== VersioningType.URI) return { enabled: false, defaults: [], prefix: 'v' };
+    const defaults = config.defaultVersion === undefined ? [] : ([] as unknown[]).concat(config.defaultVersion)
+      .map((v) => (v === VERSION_NEUTRAL ? '' : String(v)));
+    const prefix = config.prefix === false ? '' : typeof config.prefix === 'string' ? config.prefix : 'v';
+    return { enabled: true, defaults, prefix };
+  }
+
   onModuleInit() {
-    // Without a configured baseUrl the real port is only known once the app
-    // listens; print the banner then, so the links in it actually work.
+    // Prefix, versioning and port are all final once the app listens (they
+    // are set in main.ts after the module is created): print the banner then,
+    // so every link in it works. Printing earlier raced with configure().
     const options = SpecScribeModule.moduleOptions as SpecScribeOptions & { baseUrlExplicit?: boolean };
     let server: any;
     try {
-      server = options.baseUrlExplicit === false ? this.adapterHost?.httpAdapter?.getHttpServer?.() : undefined;
+      server = this.adapterHost?.httpAdapter?.getHttpServer?.();
     } catch {
       server = undefined;
     }
@@ -166,7 +188,7 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
       server.once('listening', () => {
         const address = server.address?.();
         const port = address && typeof address === 'object' ? address.port : undefined;
-        this.displayDashboard(port ? `http://localhost:${port}` : undefined);
+        this.displayDashboard(options.baseUrlExplicit === false && port ? `http://localhost:${port}` : undefined);
       });
       return;
     }
@@ -204,15 +226,22 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
     } else {
       lines.push(`${gradient}│${reset} ${yellow}○${reset} ${bold}Documentation${reset}  ${dim}disabled in production (enableDocs: true to opt in)${reset}`);
     }
+    // Docs are version-neutral; the mock answers `…/specscribe-mock/<version>/<route>`.
+    const versioning = getRuntimeVersioning();
+    const defaultVersion = versioning?.enabled ? versionSegment(versioning.defaults.find(Boolean) ?? '', versioning) : '';
     if (options.enableMock !== false) {
       lines.push(
-        `${gradient}│${reset} ${green}●${reset} ${bold}Mock Server${reset}    ${cyan}${baseUrl}${prefix}/${MOCK_ROUTE_PREFIX}${reset}`,
+        `${gradient}│${reset} ${green}●${reset} ${bold}Mock Server${reset}    ${cyan}${baseUrl}${prefix}/${MOCK_ROUTE_PREFIX}${defaultVersion ? `/${defaultVersion}` : ''}${reset}`,
       );
     } else {
       lines.push(`${gradient}│${reset} ${yellow}○${reset} ${bold}Mock Server${reset}    ${dim}disabled in production (enableMock: true to opt in)${reset}`);
     }
     lines.push(`${gradient}│${reset}`);
     lines.push(`${gradient}│${reset} ${yellow}📦${reset} Source      ${dim}${options.sourcePath}${reset}`);
+    if (versioning?.enabled) {
+      const list = versioning.defaults.map((v) => versionSegment(v, versioning) || 'neutral').join(', ') || 'none';
+      lines.push(`${gradient}│${reset} ${yellow}🔀${reset} Versioning  ${dim}URI · default ${list}${reset}`);
+    }
     lines.push(
       `${gradient}│${reset} ${yellow}🎯${reset} Controllers ${green}${bold}${SpecScribeModule.controllerCount}${reset}`,
     );
@@ -369,6 +398,8 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
     }
 
     const transformer = new OpenApiTransformer(config.baseUrl, config.globalPrefix, config.openApiVersion);
+    // Paths are rebuilt per request with the app's real prefix and URI version.
+    transformer.includeRouteMeta = true;
     const openApiSpec = transformer.transform(
       controllers,
       config.apiTitle,
@@ -460,9 +491,10 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
     // Middleware is configured during app.init(), i.e. after main.ts called
     // setGlobalPrefix(): the first point where the real prefix is known.
     setRuntimeGlobalPrefix(this.detectRuntimePrefix());
+    setRuntimeVersioning(this.detectVersioning());
 
     if (options.enableDriftDetection) {
-      const driftRoutes = this.buildExactApiRoutes(this.controllers, options.globalPrefix);
+      const driftRoutes = this.buildExactApiRoutes(this.controllers, options.globalPrefix || getRuntimeGlobalPrefix());
       if (driftRoutes.length > 0) {
         consumer.apply(DriftMiddleware).forRoutes(...driftRoutes);
       }
@@ -482,58 +514,65 @@ export class SpecScribeModule extends ConfigurableModuleClass implements OnModul
   }
 
   /**
-   * Builds exact middleware route paths for every documented API path.
-   *
-   * Using exact routes avoids wildcard syntax differences between Express 4 and
-   * Express 5 and keeps the mock reachable at exactly the paths advertised in
-   * the generated OpenAPI spec.
+   * Every route each documented endpoint answers on in the running app —
+   * one per URI version it carries (`''` = none), without the global prefix.
+   * Catch-all routes are skipped: they cannot be registered exactly across
+   * every supported Express/path-to-regexp version.
    */
-  private buildExactApiRoutes(controllers: any[], globalPrefix?: string): { path: string; method: RequestMethod }[] {
-    const routes = new Set<string>();
-    const prefix = (globalPrefix || '').replace(/^\/+|\/+$/g, '');
-
+  private routeVariants(controllers: any[]): { version: string; rest: string[] }[] {
+    const versioning = getRuntimeVersioning();
+    const out: { version: string; rest: string[] }[] = [];
     for (const controller of controllers || []) {
       for (const method of controller.methods || []) {
-        const segments = buildRouteSegments({
-          globalPrefix: prefix,
-          version: method.version || controller.version,
-          controllerPath: controller.path,
-          methodRoute: method.route,
-        });
-        if (segments.some(segment => segment.includes('*'))) {
-          // Catch-all controller routes cannot be expressed safely across all
-          // supported Express/path-to-regexp versions; skip them.
-          continue;
-        }
-        const route = toExpressRoute(segments);
-        if (route) {
-          routes.add(route);
-        }
+        const rest = buildRouteSegments({ controllerPath: controller.path, methodRoute: method.route });
+        if (rest.some((segment) => segment.includes('*'))) continue;
+        const explicit = method.version ?? controller.version;
+        const versions = routeVersions(explicit === undefined ? undefined : ([] as string[]).concat(explicit), versioning);
+        for (const version of versions) out.push({ version: versionSegment(version, versioning), rest });
       }
     }
+    return out;
+  }
 
+  /**
+   * Exact middleware routes for the real API (drift detection). Nest prepends
+   * the global prefix to middleware routes, so they are registered without it
+   * — and once more with it, for setups where the prefix is not applied.
+   */
+  private buildExactApiRoutes(controllers: any[], globalPrefix?: string): { path: string; method: RequestMethod }[] {
+    const prefix = normalizePrefix(globalPrefix);
+    const routes = new Set<string>();
+    for (const { version, rest } of this.routeVariants(controllers)) {
+      const route = toExpressRoute([version, ...rest].filter(Boolean));
+      if (!route) continue;
+      routes.add(route);
+      if (prefix) routes.add(`${prefix}/${route}`);
+    }
     return Array.from(routes).map(path => ({ path, method: RequestMethod.ALL }));
   }
 
   /**
-   * Builds exact mock routes under `/specscribe-mock`. When a global prefix is set
-   * the mock is mounted under both the prefixed and root paths so existing URLs
-   * keep working.
+   * Exact mock routes. The canonical, discoverable form is
+   * `<prefix>/specscribe-mock/<version>/<route>` (the version may be omitted);
+   * the 1.0 form that repeated the prefix (`/api/specscribe-mock/api/users`)
+   * keeps working. Registered without the global prefix, which Nest prepends,
+   * and once with it for setups where it does not.
    */
   private buildExactMockRoutes(controllers: any[], globalPrefix?: string): { path: string; method: RequestMethod }[] {
-    const apiRoutes = this.buildExactApiRoutes(controllers, globalPrefix).map(r => r.path);
-    const normalizedPrefix = (globalPrefix || '').replace(/^\/+|\/+$/g, '');
-    const prefixes = normalizedPrefix
-      ? [`${normalizedPrefix}/${MOCK_ROUTE_PREFIX}`, MOCK_ROUTE_PREFIX]
-      : [MOCK_ROUTE_PREFIX];
-
+    const prefix = normalizePrefix(globalPrefix);
     const routes = new Set<string>();
-    for (const prefix of prefixes) {
-      for (const apiRoute of apiRoutes) {
-        routes.add(apiRoute ? `${prefix}/${apiRoute}` : prefix);
+    for (const { version, rest } of this.routeVariants(controllers)) {
+      const forms = [
+        [version, ...rest],
+        rest,
+        ...(prefix ? [[prefix, version, ...rest], [prefix, ...rest]] : []),
+      ];
+      for (const form of forms) {
+        const route = toExpressRoute([MOCK_ROUTE_PREFIX, ...form].filter(Boolean));
+        routes.add(route);
+        if (prefix) routes.add(`${prefix}/${route}`);
       }
     }
-
     return Array.from(routes).map(path => ({ path, method: RequestMethod.ALL }));
   }
 }

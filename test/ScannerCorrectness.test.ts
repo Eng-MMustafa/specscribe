@@ -41,7 +41,8 @@ describe('Scanner correctness', () => {
     });
 
     it('reads the version from @Controller({ version })', () => {
-      expect(accounts.version).toBeUndefined();
+      // Nest serves this controller under /v2 when URI versioning is on.
+      expect(accounts.version).toBe('2');
     });
 
     it('treats a bare @Controller() as the root path', () => {
@@ -132,27 +133,27 @@ describe('OpenApiTransformer correctness', () => {
   describe('globalPrefix', () => {
     it('omits the prefix when none is configured', () => {
       const spec = new OpenApiTransformer('http://localhost:3000').transform(controllers);
-      expect(spec.paths['/accounts']).toBeDefined();
+      expect(spec.paths['/v2/accounts']).toBeDefined();
     });
 
     it('prepends the configured prefix to every path', () => {
       // Without this, the documented paths do not exist on the running app.
       const spec = new OpenApiTransformer('http://localhost:3000', 'api').transform(controllers);
-      expect(spec.paths['/api/accounts']).toBeDefined();
-      expect(spec.paths['/api/accounts/{id}']).toBeDefined();
-      expect(spec.paths['/accounts']).toBeUndefined();
+      expect(spec.paths['/api/v2/accounts']).toBeDefined();
+      expect(spec.paths['/api/v2/accounts/{id}']).toBeDefined();
+      expect(spec.paths['/v2/accounts']).toBeUndefined();
     });
 
     it('normalises surrounding slashes in the prefix', () => {
       const spec = new OpenApiTransformer('http://localhost:3000', '/api/v1/').transform(controllers);
-      expect(spec.paths['/api/v1/accounts']).toBeDefined();
+      expect(spec.paths['/api/v1/v2/accounts']).toBeDefined();
     });
   });
 
   describe('status codes', () => {
     it('uses the @HttpCode value as the success response', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      const post = spec.paths['/accounts'].post;
+      const post = spec.paths['/v2/accounts'].post;
       expect(post.responses['202']).toBeDefined();
       // 201 was the previous hard-coded guess for POST.
       expect(post.responses['201']).toBeUndefined();
@@ -160,7 +161,7 @@ describe('OpenApiTransformer correctness', () => {
 
     it('omits a response body for 204 No Content', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      const del = spec.paths['/accounts/{id}'].delete;
+      const del = spec.paths['/v2/accounts/{id}'].delete;
       expect(del.responses['204']).toBeDefined();
       expect(del.responses['204'].content).toBeUndefined();
     });
@@ -169,7 +170,7 @@ describe('OpenApiTransformer correctness', () => {
   describe('@All expansion', () => {
     it('expands to the concrete verbs OpenAPI understands', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      const webhook = spec.paths['/accounts/webhook'];
+      const webhook = spec.paths['/v2/accounts/webhook'];
       expect(webhook.get).toBeDefined();
       expect(webhook.post).toBeDefined();
       expect(webhook.put).toBeDefined();
@@ -182,23 +183,23 @@ describe('OpenApiTransformer correctness', () => {
   describe('operation metadata', () => {
     it('uses the JSDoc summary instead of the raw method name', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      expect(spec.paths['/accounts'].get.summary).toBe('List every account');
+      expect(spec.paths['/v2/accounts'].get.summary).toBe('List every account');
     });
 
     it('falls back to the method name when there is no JSDoc', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      expect(spec.paths['/accounts/preflight'].options.summary).toBe('preflight');
+      expect(spec.paths['/v2/accounts/preflight'].options.summary).toBe('preflight');
     });
 
     it('emits a stable operationId', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      expect(spec.paths['/accounts'].get.operationId).toBe('AccountsController_listAccounts');
+      expect(spec.paths['/v2/accounts'].get.operationId).toBe('AccountsController_listAccounts');
     });
 
     it('marks deprecated operations', () => {
       const spec = new OpenApiTransformer().transform(controllers);
-      expect(spec.paths['/accounts/legacy/{id}'].get.deprecated).toBe(true);
-      expect(spec.paths['/accounts'].get.deprecated).toBeUndefined();
+      expect(spec.paths['/v2/accounts/legacy/{id}'].get.deprecated).toBe(true);
+      expect(spec.paths['/v2/accounts'].get.deprecated).toBeUndefined();
     });
   });
 });

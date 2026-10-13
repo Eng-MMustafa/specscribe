@@ -45,7 +45,7 @@ inputs:
   version:
     description: 'specscribe version to run'
     required: false
-    default: '1.0.0'
+    default: '1.1.0'
 
 runs:
   using: 'composite'

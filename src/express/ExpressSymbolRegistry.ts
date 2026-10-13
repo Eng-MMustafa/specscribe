@@ -2,7 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { resolveExistingPathWithinRoot } from '../utils/PathSecurity';
-import { balancedSlice, readExpression } from './ExpressLexical';
+import { balancedSlice, objectEntries, readExpression, splitTopLevel } from './ExpressLexical';
 
 export type SymbolKind = 'value' | 'interface' | 'type' | 'class' | 'enum';
 
@@ -63,6 +63,103 @@ export class ExpressSymbolRegistry {
     const imported = info.imports.get(name);
     if (imported) return this.resolveExported(imported.name, imported.file, depth + 1);
     return null;
+  }
+
+  /**
+   * The compile-time string value of an expression written in `fromFile`,
+   * following imports (ES and CommonJS) across the project:
+   * `'x'`, `` `/${NS}` ``, `'chat:' + 'send'`, `EVENTS.JOIN`, `EVENTS['JOIN']`,
+   * `Object.freeze({ … })` / `as const` objects, nested members and TS enums.
+   * `undefined` when the value only exists at runtime.
+   */
+  resolveString(expression: string, fromFile: string, depth = 0): string | undefined {
+    if (depth > 10 || !expression) return undefined;
+    let expr = expression.trim().replace(/\s+as\s+const$/, '').trim();
+    while (expr.startsWith('(') && balancedSlice(expr, 0).length === expr.length) expr = expr.slice(1, -1).trim();
+    if (!expr) return undefined;
+
+    const quoted = /^(['"])((?:\\.|(?!\1)[^\\])*)\1$/.exec(expr);
+    if (quoted) return quoted[2].replace(/\\(.)/g, '$1');
+    if (/^-?\d+(?:\.\d+)?$/.test(expr)) return expr;
+    if (expr.startsWith('`') && expr.endsWith('`') && expr.length >= 2) {
+      const body = expr.slice(1, -1);
+      let out = '';
+      for (let i = 0; i < body.length; i++) {
+        if (body[i] === '\\') { out += body[i + 1] ?? ''; i++; continue; }
+        if (body[i] === '$' && body[i + 1] === '{') {
+          const block = balancedSlice(body, i + 1);
+          const value = this.resolveString(block.slice(1, -1), fromFile, depth + 1);
+          if (value === undefined) return undefined;
+          out += value;
+          i += block.length;
+          continue;
+        }
+        out += body[i];
+      }
+      return out;
+    }
+
+    const parts = splitTopLevel(expr, '+');
+    if (parts.length > 1) {
+      let out = '';
+      for (const part of parts) {
+        const value = this.resolveString(part, fromFile, depth + 1);
+        if (value === undefined) return undefined;
+        out += value;
+      }
+      return out;
+    }
+
+    // A.B.C / A['B'] — a constant, an object member or an enum member.
+    const chain = /^([A-Za-z_$][\w$]*)((?:\s*\.\s*[A-Za-z_$][\w$]*|\s*\[\s*(['"])[^'"]+\3\s*\])*)$/.exec(expr);
+    if (!chain) return undefined;
+    const members = [...chain[2].matchAll(/\.\s*([A-Za-z_$][\w$]*)|\[\s*['"]([^'"]+)['"]\s*\]/g)].map((m) => m[1] ?? m[2]);
+    const head = this.resolve(chain[1], fromFile);
+    if (!head) return undefined;
+    let text = head.text;
+    let file = head.filePath;
+    let kind = head.kind;
+    for (const member of members) {
+      if (kind === 'enum') {
+        const entry = new RegExp(`(?:^|,|\\n)\\s*['"]?${member.replace(/[$]/g, '\\$')}['"]?\\s*=\\s*([^,\\n]+)`).exec(text);
+        return entry ? this.resolveString(entry[1], file, depth + 1) : undefined;
+      }
+      if (kind !== 'value') return undefined;
+      const object = this.objectLiteralOf(text);
+      const next = object ? this.memberOfObjectLiteral(object, member) : null;
+      if (next === null) {
+        // `{ X }` / `X: Y` pointing at another constant: resolve that first.
+        const nested = /^[A-Za-z_$][\w$.]*$/.test(text.trim()) ? this.resolve(text.trim(), file) : null;
+        if (!nested) return undefined;
+        const object2 = this.objectLiteralOf(nested.text);
+        const viaNested = object2 ? this.memberOfObjectLiteral(object2, member) : null;
+        if (viaNested === null) return undefined;
+        text = viaNested;
+        file = nested.filePath;
+        kind = 'value';
+        continue;
+      }
+      if (next === member) {
+        // Shorthand `{ member }`: the local declaration of that name.
+        const local = this.resolve(member, file);
+        if (!local) return undefined;
+        text = local.text;
+        file = local.filePath;
+        kind = local.kind;
+        continue;
+      }
+      text = next;
+    }
+    return kind === 'value' ? this.resolveString(text, file, depth + 1) : undefined;
+  }
+
+  /** `{ … }` behind `Object.freeze({ … })`, `({ … })` and `{ … } as const`. */
+  private objectLiteralOf(text: string): string | null {
+    let t = text.trim().replace(/\s+as\s+const$/, '').trim();
+    const frozen = /^Object\s*\.\s*freeze\s*\(/.exec(t);
+    if (frozen) t = t.slice(frozen[0].length - 1).trim();
+    while (t.startsWith('(') && balancedSlice(t, 0).length === t.length) t = t.slice(1, -1).trim();
+    return t.startsWith('{') ? t : null;
   }
 
   private resolveExported(name: string, file: string, depth: number): SymbolDefinition | null {
@@ -171,12 +268,12 @@ export class ExpressSymbolRegistry {
   private memberOfObjectLiteral(objectText: string, member: string): string | null {
     const trimmed = objectText.trim();
     if (!trimmed.startsWith('{')) return null;
+    // Entry-aware split: a value ends at its own top-level comma, so the first
+    // member no longer swallows the rest of the object (`{ A: 'a', B: 'b' }`).
     const inner = balancedSlice(trimmed, 0).slice(1, -1);
-    const esc = member.replace(/[$]/g, '\\$');
-    const match = new RegExp(`(?:^|,|\\n)\\s*(?:['"])?${esc}(?:['"])?\\s*:`).exec(inner);
-    if (match) return readExpression(inner, match.index + match[0].length).replace(/,\s*$/, '').trim();
-    const shorthand = new RegExp(`(?:^|,|\\n)\\s*${esc}\\s*(?=,|\\n|$)`).exec(inner);
-    return shorthand ? member : null;
+    const entry = objectEntries(inner).find((e) => !e.spread && e.key === member);
+    if (!entry) return null;
+    return entry.shorthand ? member : entry.value;
   }
 
   private defaultExportName(text: string): string | null {

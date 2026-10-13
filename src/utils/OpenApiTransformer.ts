@@ -3,6 +3,7 @@ import { ControllerInfo, MethodInfo } from '../scanner/ScannerService';
 import { AnalyzedType } from './DtoAnalyzer';
 import { ValidationConstraints } from './ValidationExtractor';
 import { buildRouteSegments, toOpenApiPath } from './RoutePath';
+import { ROUTE_META, RouteMeta } from './LiveSpec';
 import { sanitizeTypeName } from './SchemaName';
 
 /** Verbs that `@All()` expands to in the generated document. */
@@ -49,6 +50,13 @@ export class OpenApiTransformer {
    *   generated path is wrong for applications that use a prefix.
    * @param openApiVersion OpenAPI spec version to emit.
    */
+  /**
+   * Record how each path is built (`x-specscribe-route`) so a running app can
+   * rebuild it with its real prefix and URI version. Internal: stripped
+   * before the document is served. Off for files written by the CLI.
+   */
+  includeRouteMeta = false;
+
   constructor(baseUrl = 'http://localhost:3000', globalPrefix = '', openApiVersion: '3.0.0' | '3.1.0' = '3.0.0') {
     this.baseUrl = baseUrl;
     this.globalPrefix = globalPrefix.replace(/^\/+|\/+$/g, '');
@@ -97,6 +105,12 @@ export class OpenApiTransformer {
 
         if (!paths[fullPath]) {
           paths[fullPath] = {};
+          if (this.includeRouteMeta) {
+            const explicit = methodVersion === undefined ? undefined : ([] as string[]).concat(methodVersion);
+            const meta: RouteMeta = { rest: toOpenApiPath(buildRouteSegments({ controllerPath: controller.path, methodRoute: method.route })) };
+            if (explicit) meta.version = explicit;
+            (paths[fullPath] as Record<string, unknown>)[ROUTE_META] = meta;
+          }
         }
 
         const verb = method.httpMethod.toLowerCase();
